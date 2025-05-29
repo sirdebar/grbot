@@ -17,6 +17,7 @@ WAITING_FOR_TOPIC_ID = 2
 
 # Словарь для хранения тем
 topics_dict = {}
+workers_dict = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -105,6 +106,10 @@ async def worker_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message_thread_id=topic_id,
         text=f"Внимание! {user_mentions}"
     )
+
+    if chat.id not in workers_dict:
+        workers_dict[chat.id] = {}
+    workers_dict[chat.id][topic_id] = users
 
 async def create_topic_with_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -249,6 +254,19 @@ async def list_topics(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Убедитесь, что бот добавлен в группу как администратор."
         )
 
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    if update.message.text.lower() == "номер":
+        chat_id = update.message.chat_id
+        message_thread_id = update.message.message_thread_id
+
+        if chat_id in workers_dict and message_thread_id in workers_dict[chat_id]:
+            workers = workers_dict[chat_id][message_thread_id]
+            user_mentions = " ".join(workers)
+            await update.message.reply_text(f"Внимание! {user_mentions}")
+
 def main():
     application = Application.builder().token(TOKEN).build()
 
@@ -268,6 +286,7 @@ def main():
     application.add_handler(CommandHandler("worker", worker_command))
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
