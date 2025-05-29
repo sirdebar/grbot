@@ -71,46 +71,77 @@ async def request_topic_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return ConversationHandler.END
 
+async def worker_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Использование: /worker название_темы @user1 @user2 ...")
+        return
+
+    topic_name = context.args[0]
+    users = context.args[1:]
+    
+    if not users:
+        await update.message.reply_text("Необходимо указать хотя бы одного пользователя")
+        return
+
+    chat = await context.bot.get_chat(update.message.chat_id)
+    
+    if not await check_forum_support(chat.id, context):
+        await update.message.reply_text("Эта группа не поддерживает темы")
+        return
+
+    topic_id = None
+    for tid, name in topics_dict.get(chat.id, {}).items():
+        if name == topic_name:
+            topic_id = tid
+            break
+
+    if not topic_id:
+        await update.message.reply_text(f"Тема '{topic_name}' не найдена")
+        return
+
+    user_mentions = " ".join(users)
+    await context.bot.send_message(
+        chat_id=chat.id,
+        message_thread_id=topic_id,
+        text=f"Внимание! {user_mentions}"
+    )
+
 async def create_topic_with_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    topic_name = update.message.text
+    text = update.message.text
     chat = await context.bot.get_chat(update.message.chat_id)
     
     if not await check_forum_support(chat.id, context):
         await update.message.reply_text(
-            "Эта группа не поддерживает создание тем. "
-            "Для использования тем группа должна быть настроена как форум."
+            "Эта группа не поддерживает создание тем"
         )
         return ConversationHandler.END
-    
+
     try:
-        topic = await context.bot.create_forum_topic(
-            chat_id=chat.id,
-            name=topic_name
-        )
-        
-        # Сохраняем информацию о теме
-        if chat.id not in topics_dict:
-            topics_dict[chat.id] = {}
-        topics_dict[chat.id][topic.message_thread_id] = topic_name
-        
-        await update.message.reply_text(
-            f"Тема '{topic_name}' успешно создана!\n"
-            f"ID темы: {topic.message_thread_id}"
-        )
-    except Exception as e:
-        error_message = str(e)
-        if "chat is not a forum" in error_message.lower():
-            await update.message.reply_text(
-                "Эта группа не поддерживает создание тем. "
-                "Для использования тем группа должна быть настроена как форум. "
-                "Обратитесь к администратору группы для настройки."
-            )
+        if text.isdigit():
+            count = int(text)
+            for i in range(1, count + 1):
+                topic_name = f"ПК{i}"
+                await create_single_topic(chat.id, topic_name, context)
+            await update.message.reply_text(f"Создано {count} тем")
         else:
-            await update.message.reply_text(
-                f"Ошибка при создании темы: {error_message}"
-            )
+            topics = [t.strip() for t in text.split('\n') if t.strip()]
+            for topic_name in topics:
+                await create_single_topic(chat.id, topic_name, context)
+            await update.message.reply_text(f"Создано {len(topics)} тем")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка при создании тем: {str(e)}")
     
     return ConversationHandler.END
+
+async def create_single_topic(chat_id: int, topic_name: str, context: ContextTypes.DEFAULT_TYPE):
+    topic = await context.bot.create_forum_topic(
+        chat_id=chat_id,
+        name=topic_name
+    )
+    
+    if chat_id not in topics_dict:
+        topics_dict[chat_id] = {}
+    topics_dict[chat_id][topic.message_thread_id] = topic_name
 
 async def request_topic_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -234,6 +265,7 @@ def main():
     )
 
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("worker", worker_command))
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(button_handler))
 
