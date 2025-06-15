@@ -14,16 +14,23 @@ logging.basicConfig(
 
 WAITING_FOR_TOPIC_NAME = 1
 WAITING_FOR_TOPIC_ID = 2
+WAITING_FOR_BROADCAST = 3
+WAITING_FOR_RENAME_COUNT = 4
+WAITING_FOR_RENAME = 5
 
 # Словарь для хранения тем
 topics_dict = {}
 workers_dict = {}
+rename_topics_dict = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("Список тем", callback_data='list_topics')],
         [InlineKeyboardButton("Создать тему", callback_data='create_topic')],
-        [InlineKeyboardButton("Удалить тему", callback_data='delete_topic')]
+        [InlineKeyboardButton("Удалить тему", callback_data='delete_topic')],
+        [InlineKeyboardButton("Удалить все темы", callback_data='delete_all_topics')],
+        [InlineKeyboardButton("Создать рассылку", callback_data='create_broadcast')],
+        [InlineKeyboardButton("🖌 Создать темы с переименованием", callback_data='create_rename_topics')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
@@ -41,6 +48,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await request_topic_name(update, context)
     elif query.data == 'delete_topic':
         await request_topic_id(update, context)
+    elif query.data == 'delete_all_topics':
+        await delete_all_topics(update, context)
+    elif query.data == 'create_broadcast':
+        await request_broadcast_message(update, context)
+    elif query.data == 'create_rename_topics':
+        await request_rename_topics_count(update, context)
+    elif query.data == 'confirm_rename':
+        await request_rename_name(update, context)
 
 async def check_forum_support(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
@@ -267,23 +282,211 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_mentions = " ".join(workers)
             await update.message.reply_text(f"Внимание! {user_mentions}")
 
+async def delete_all_topics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat = await context.bot.get_chat(query.message.chat_id)
+    
+    if chat.type not in ['group', 'supergroup']:
+        await query.message.reply_text("Эта команда доступна только в группах.")
+        return
+
+    if not await check_forum_support(chat.id, context):
+        await query.message.reply_text("Эта группа не поддерживает темы")
+        return
+
+    if chat.id not in topics_dict or not topics_dict[chat.id]:
+        await query.message.reply_text("В этой группе нет тем для удаления")
+        return
+
+    deleted_count = 0
+    for topic_id in list(topics_dict[chat.id].keys()):
+        try:
+            await context.bot.delete_forum_topic(
+                chat_id=chat.id,
+                message_thread_id=topic_id
+            )
+            deleted_count += 1
+        except Exception as e:
+            logging.error(f"Ошибка при удалении темы {topic_id}: {str(e)}")
+
+    topics_dict[chat.id] = {}
+    if chat.id in workers_dict:
+        workers_dict[chat.id] = {}
+
+    await query.message.reply_text(f"Успешно удалено {deleted_count} тем")
+
+async def request_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat = await context.bot.get_chat(query.message.chat_id)
+    
+    if chat.type not in ['group', 'supergroup']:
+        await query.message.reply_text("Эта команда доступна только в группах.")
+        return
+
+    if not await check_forum_support(chat.id, context):
+        await query.message.reply_text("Эта группа не поддерживает темы")
+        return
+
+    if chat.id not in topics_dict or not topics_dict[chat.id]:
+        await query.message.reply_text("В этой группе нет тем для рассылки")
+        return
+
+    await query.message.reply_text("Введите сообщение для рассылки во все темы:")
+    return WAITING_FOR_BROADCAST
+
+async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message_text = update.message.text
+    chat = await context.bot.get_chat(update.message.chat_id)
+    
+    if chat.id not in topics_dict or not topics_dict[chat.id]:
+        await update.message.reply_text("В этой группе нет тем для рассылки")
+        return ConversationHandler.END
+
+    sent_count = 0
+    for topic_id in topics_dict[chat.id].keys():
+        try:
+            await context.bot.send_message(
+                chat_id=chat.id,
+                message_thread_id=topic_id,
+                text=message_text
+            )
+            sent_count += 1
+        except Exception as e:
+            logging.error(f"Ошибка при отправке сообщения в тему {topic_id}: {str(e)}")
+
+    await update.message.reply_text(f"Сообщение отправлено в {sent_count} тем")
+    return ConversationHandler.END
+
+async def request_rename_topics_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat = await context.bot.get_chat(query.message.chat_id)
+    
+    if chat.type not in ['group', 'supergroup']:
+        await query.message.reply_text("Эта команда доступна только в группах.")
+        return
+
+    if not await check_forum_support(chat.id, context):
+        await query.message.reply_text("Эта группа не поддерживает темы")
+        return
+
+    await query.message.reply_text("Введите количество тем для создания:")
+    return WAITING_FOR_RENAME_COUNT
+
+async def create_rename_topics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        count = int(update.message.text)
+        chat = await context.bot.get_chat(update.message.chat_id)
+        
+        if chat.id not in rename_topics_dict:
+            rename_topics_dict[chat.id] = []
+
+        created_count = 0
+        for i in range(1, count + 1):
+            try:
+                topic = await context.bot.create_forum_topic(
+                    chat_id=chat.id,
+                    name=f"{i}:Без названия"
+                )
+                
+                if chat.id not in topics_dict:
+                    topics_dict[chat.id] = {}
+                topics_dict[chat.id][topic.message_thread_id] = f"{i}:Без названия"
+                
+                rename_topics_dict[chat.id].append(topic.message_thread_id)
+                created_count += 1
+            except Exception as e:
+                logging.error(f"Ошибка при создании темы {i}: {str(e)}")
+
+        await update.message.reply_text(
+            f"Создано {created_count} тем для переименования.\n"
+            "Воркеры могут использовать команду /tema для переименования тем."
+        )
+    except ValueError:
+        await update.message.reply_text("Пожалуйста, введите корректное число")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка при создании тем: {str(e)}")
+    
+    return ConversationHandler.END
+
+async def tema_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = await context.bot.get_chat(update.message.chat_id)
+    
+    if chat.id not in rename_topics_dict or not rename_topics_dict[chat.id]:
+        await update.message.reply_text("Нет доступных тем для переименования")
+        return
+
+    keyboard = [[InlineKeyboardButton("✅", callback_data='confirm_rename')]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "Чтобы изменить название темы, введите своё имя.\n"
+        "Перед этим нажмите на галочку ниже.",
+        reply_markup=reply_markup
+    )
+
+async def request_rename_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat = await context.bot.get_chat(query.message.chat_id)
+    
+    if chat.id not in rename_topics_dict or not rename_topics_dict[chat.id]:
+        await query.message.reply_text("Нет доступных тем для переименования")
+        return ConversationHandler.END
+
+    await query.message.reply_text("Введите своё имя:")
+    return WAITING_FOR_RENAME
+
+async def rename_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    new_name = update.message.text
+    chat = await context.bot.get_chat(update.message.chat_id)
+    
+    if chat.id not in rename_topics_dict or not rename_topics_dict[chat.id]:
+        await update.message.reply_text("Нет доступных тем для переименования")
+        return ConversationHandler.END
+
+    topic_id = rename_topics_dict[chat.id][0]
+    old_name = topics_dict[chat.id][topic_id]
+    number = old_name.split(":")[0]
+    
+    try:
+        await context.bot.edit_forum_topic(
+            chat_id=chat.id,
+            message_thread_id=topic_id,
+            name=f"{number}:{new_name}"
+        )
+        
+        topics_dict[chat.id][topic_id] = f"{number}:{new_name}"
+        rename_topics_dict[chat.id].pop(0)
+        
+        await update.message.reply_text(f"Тема успешно переименована в {number}:{new_name}")
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка при переименовании темы: {str(e)}")
+    
+    return ConversationHandler.END
+
 def main():
     application = Application.builder().token(TOKEN).build()
 
     conv_handler = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(request_topic_name, pattern='^create_topic$'),
-            CallbackQueryHandler(request_topic_id, pattern='^delete_topic$')
+            CallbackQueryHandler(request_topic_id, pattern='^delete_topic$'),
+            CallbackQueryHandler(request_broadcast_message, pattern='^create_broadcast$'),
+            CallbackQueryHandler(request_rename_topics_count, pattern='^create_rename_topics$'),
+            CallbackQueryHandler(request_rename_name, pattern='^confirm_rename$')
         ],
         states={
             WAITING_FOR_TOPIC_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_topic_with_name)],
-            WAITING_FOR_TOPIC_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_topic_by_id)]
+            WAITING_FOR_TOPIC_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, delete_topic_by_id)],
+            WAITING_FOR_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, send_broadcast)],
+            WAITING_FOR_RENAME_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_rename_topics)],
+            WAITING_FOR_RENAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, rename_topic)]
         },
         fallbacks=[]
     )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("worker", worker_command))
+    application.add_handler(CommandHandler("tema", tema_command))
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
