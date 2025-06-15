@@ -1,7 +1,9 @@
 import os
 import logging
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters, ConversationHandler
+from telegram.error import RetryAfter
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -411,23 +413,48 @@ async def create_rename_topics(update: Update, context: ContextTypes.DEFAULT_TYP
                 keyboard = [[InlineKeyboardButton("✅", callback_data=f'confirm_rename_{topic.message_thread_id}')]]
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 
-                await context.bot.send_message(
-                    chat_id=chat.id,
-                    message_thread_id=topic.message_thread_id,
-                    text="Чтобы изменить название темы, введите своё имя.\n"
-                         "Перед этим нажмите на галочку ниже.",
-                    reply_markup=reply_markup
-                )
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat.id,
+                        message_thread_id=topic.message_thread_id,
+                        text="Чтобы изменить название темы, введите своё имя.\n"
+                             "Перед этим нажмите на галочку ниже.",
+                        reply_markup=reply_markup
+                    )
+                except RetryAfter as e:
+                    await asyncio.sleep(e.retry_after)
+                    await context.bot.send_message(
+                        chat_id=chat.id,
+                        message_thread_id=topic.message_thread_id,
+                        text="Чтобы изменить название темы, введите своё имя.\n"
+                             "Перед этим нажмите на галочку ниже.",
+                        reply_markup=reply_markup
+                    )
                 
                 created_count += 1
+                
+                if i < count:  # Не ждем после создания последней темы
+                    await asyncio.sleep(5)  # Увеличиваем задержку до 5 секунд
+                    
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after)
+                continue
             except Exception as e:
                 logging.error(f"Ошибка при создании темы {i}: {str(e)}")
 
-        await update.message.reply_text(f"Создано {created_count} тем для переименования.")
+        try:
+            await update.message.reply_text(f"Создано {created_count} тем для переименования.")
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            await update.message.reply_text(f"Создано {created_count} тем для переименования.")
     except ValueError:
         await update.message.reply_text("Пожалуйста, введите корректное число")
     except Exception as e:
-        await update.message.reply_text(f"Ошибка при создании тем: {str(e)}")
+        try:
+            await update.message.reply_text(f"Ошибка при создании тем: {str(e)}")
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            await update.message.reply_text(f"Ошибка при создании тем: {str(e)}")
     
     return ConversationHandler.END
 
