@@ -35,6 +35,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🖌 Создать темы с переименованием", callback_data='create_rename_topics')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("👋")
     await update.message.reply_text(
         'Привет! Я бот для управления темами в группах. Выберите действие:',
         reply_markup=reply_markup
@@ -151,7 +152,7 @@ async def create_topic_with_name(update: Update, context: ContextTypes.DEFAULT_T
             "Эта группа не поддерживает создание тем"
         )
         return ConversationHandler.END
-
+    
     try:
         if text.isdigit():
             count = int(text)
