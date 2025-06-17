@@ -24,6 +24,10 @@ WAITING_FOR_RENAME = 5
 topics_dict = {}
 workers_dict = {}
 rename_topics_dict = {}
+# Список SOS-слов
+sos_words = set()
+# Словарь для хранения оригинальных аватарок чатов
+original_avatars = {}
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
@@ -71,7 +75,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'old_name': topics_dict[chat.id][topic_id]
         }
         
-        await query.message.reply_text("Введите своё имя:")
+        # Сохраняем ID сообщения с кнопкой подтверждения
+        context.user_data['confirmation_message_id'] = query.message.message_id
+        
+        # Отправляем сообщение с запросом имени и сохраняем его ID
+        message = await query.message.reply_text("Введите своё имя:")
+        context.user_data['request_name_message_id'] = message.message_id
+        
         return WAITING_FOR_RENAME
 
 async def check_forum_support(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -484,11 +494,176 @@ async def rename_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rename_topics_dict[chat_id].discard(topic_id)
         
         await update.message.reply_text(f"Тема успешно переименована в {number}:{new_name}")
+        
+        # Удаляем сообщения бота
+        try:
+            # Удаляем сообщение с кнопкой подтверждения
+            if 'confirmation_message_id' in context.user_data:
+                await context.bot.delete_message(
+                    chat_id=chat_id,
+                    message_id=context.user_data['confirmation_message_id']
+                )
+            # Удаляем сообщение с запросом имени
+            if 'request_name_message_id' in context.user_data:
+                await context.bot.delete_message(
+                    chat_id=chat_id,
+                    message_id=context.user_data['request_name_message_id']
+                )
+        except Exception as e:
+            print(f"Ошибка при удалении сообщений: {str(e)}")
+            
     except Exception as e:
         await update.message.reply_text(f"Ошибка при переименовании темы: {str(e)}")
     
     context.user_data.pop('current_rename_topic', None)
+    context.user_data.pop('confirmation_message_id', None)
+    context.user_data.pop('request_name_message_id', None)
     return ConversationHandler.END
+
+async def is_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    try:
+        chat_member = await context.bot.get_chat_member(chat_id, user_id)
+        return chat_member.status in ['creator', 'administrator']
+    except Exception:
+        return False
+
+async def add_sos_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_chat.id, update.effective_user.id, context):
+        await update.message.reply_text("Эта команда доступна только администраторам")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Использование: /gadd слово")
+        return
+
+    word = context.args[0].lower()
+    if word in sos_words:
+        await update.message.reply_text(f"Слово '{word}' уже есть в списке")
+        return
+
+    sos_words.add(word)
+    await update.message.reply_text(f"Слово '{word}' добавлено в список SOS-слов")
+
+async def delete_sos_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_chat.id, update.effective_user.id, context):
+        await update.message.reply_text("Эта команда доступна только администраторам")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Использование: /gdel слово")
+        return
+
+    word = context.args[0].lower()
+    if word not in sos_words:
+        await update.message.reply_text(f"Слово '{word}' не найдено в списке")
+        return
+
+    sos_words.remove(word)
+    await update.message.reply_text(f"Слово '{word}' удалено из списка SOS-слов")
+
+async def list_sos_words(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_chat.id, update.effective_user.id, context):
+        await update.message.reply_text("Эта команда доступна только администраторам")
+        return
+
+    if not sos_words:
+        await update.message.reply_text("Список SOS-слов пуст")
+        return
+
+    words_list = "\n".join(sorted(sos_words))
+    await update.message.reply_text(f"Список SOS-слов:\n{words_list}")
+
+async def check_sos_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    chat_id = update.message.chat_id
+    message_text = update.message.text.lower()
+    logging.info(f"Проверка сообщения: {message_text}")
+
+    # Проверяем, содержит ли сообщение SOS-слово
+    for word in sos_words:
+        if word in message_text:
+            logging.info(f"Найдено SOS-слово: {word}")
+            try:
+                # Проверяем все темы в чате
+                if chat_id in topics_dict:
+                    for topic_id in topics_dict[chat_id].keys():
+                        try:
+                            # Сохраняем оригинальную иконку темы, если её ещё нет
+                            if (chat_id, topic_id) not in original_avatars:
+                                try:
+                                    topic = await context.bot.get_forum_topic(chat_id=chat_id, message_thread_id=topic_id)
+                                    if topic and topic.icon_custom_emoji_id:
+                                        original_avatars[(chat_id, topic_id)] = topic.icon_custom_emoji_id
+                                except Exception as e:
+                                    logging.error(f"Ошибка при получении информации о теме {topic_id}: {str(e)}")
+
+                            # Меняем иконку темы на SOS
+                            await context.bot.edit_forum_topic(
+                                chat_id=chat_id,
+                                message_thread_id=topic_id,
+                                icon_custom_emoji_id="🆘"
+                            )
+                            logging.info(f"Иконка темы {topic_id} успешно изменена на SOS")
+                        except Exception as e:
+                            logging.error(f"Ошибка при изменении иконки темы {topic_id}: {str(e)}")
+                            # Пробуем альтернативный метод
+                            try:
+                                await context.bot.edit_forum_topic(
+                                    chat_id=chat_id,
+                                    message_thread_id=topic_id,
+                                    name=topics_dict[chat_id][topic_id],
+                                    icon_custom_emoji_id="🆘"
+                                )
+                                logging.info(f"Иконка темы {topic_id} успешно изменена альтернативным методом")
+                            except Exception as e2:
+                                logging.error(f"Ошибка при альтернативном изменении иконки темы {topic_id}: {str(e2)}")
+            except Exception as e:
+                logging.error(f"Общая ошибка при обработке SOS-слова: {str(e)}")
+
+async def restore_topic_icon(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    message_thread_id = update.message.message_thread_id
+    
+    if (chat_id, message_thread_id) in original_avatars:
+        try:
+            await context.bot.edit_forum_topic(
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                icon_custom_emoji_id=original_avatars[(chat_id, message_thread_id)]
+            )
+            del original_avatars[(chat_id, message_thread_id)]
+        except Exception as e:
+            logging.error(f"Ошибка при восстановлении иконки темы: {str(e)}")
+
+async def test_sos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await is_admin(update.effective_chat.id, update.effective_user.id, context):
+        await update.message.reply_text("Эта команда доступна только администраторам")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Использование: /gtest слово")
+        return
+
+    word = context.args[0].lower()
+    if word not in sos_words:
+        await update.message.reply_text(f"Слово '{word}' не найдено в списке SOS-слов")
+        return
+
+    # Создаем тестовое сообщение
+    test_message = type('TestMessage', (), {
+        'chat_id': update.message.chat_id,
+        'text': word,
+        'message_thread_id': update.message.message_thread_id
+    })
+    
+    # Создаем тестовый update
+    test_update = type('TestUpdate', (), {'message': test_message})
+    
+    # Вызываем проверку
+    await check_sos_word(test_update, context)
+    await update.message.reply_text("Тест SOS-слова выполнен")
 
 def main():
     application = Application.builder().token(TOKEN).build()
@@ -513,9 +688,15 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("worker", worker_command))
+    application.add_handler(CommandHandler("gadd", add_sos_word))
+    application.add_handler(CommandHandler("gdel", delete_sos_word))
+    application.add_handler(CommandHandler("gall", list_sos_words))
+    application.add_handler(CommandHandler("grestore", restore_topic_icon))
+    application.add_handler(CommandHandler("gtest", test_sos))
     application.add_handler(conv_handler)
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_sos_word))
 
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
