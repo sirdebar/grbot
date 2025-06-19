@@ -46,6 +46,11 @@ original_avatars = {}
 active_topics = {}
 # Словарь для хранения ID топика "Активные темы" и ID сообщения в нем
 active_topics_info = {}
+# Словарь для хранения времени активации SOS
+sos_activation_times = {}
+# Словари для отслеживания задач
+sos_removal_tasks = {}
+sos_update_tasks = {}
 # Словари для игр
 game_sessions = {}
 guess_numbers = {}
@@ -110,9 +115,27 @@ async def update_active_topics_message(chat_id: int, context: ContextTypes.DEFAU
         if chat_id in active_topics and active_topics[chat_id]:
             text = "Темы в которых нужен номер:\n"
             chat = await context.bot.get_chat(chat_id)
+            import time
 
             for active_topic_id in active_topics[chat_id]:
                 topic_name = topics_dict.get(chat_id, {}).get(active_topic_id, f"Тема {active_topic_id}")
+                
+                # Вычисляем время простоя
+                activation_time = sos_activation_times.get((chat_id, active_topic_id))
+                if activation_time:
+                    elapsed_seconds = int(time.time() - activation_time)
+                    if elapsed_seconds < 60:
+                        time_str = f"({elapsed_seconds} секунд простой)"
+                    else:
+                        minutes = elapsed_seconds // 60
+                        seconds = elapsed_seconds % 60
+                        if seconds > 0:
+                            time_str = f"({minutes} минут {seconds} секунд простой)"
+                        else:
+                            time_str = f"({minutes} минут простой)"
+                else:
+                    time_str = "(время неизвестно)"
+                
                 # Создаем ссылку на топик
                 if chat.username:
                     link = f"https://t.me/{chat.username}/{active_topic_id}"
@@ -120,7 +143,7 @@ async def update_active_topics_message(chat_id: int, context: ContextTypes.DEFAU
                     # Для приватных чатов используем другой формат
                     link = f"https://t.me/c/{str(chat_id)[4:]}/{active_topic_id}"
 
-                text += f"• {topic_name} - {link}\n"
+                text += f"• {topic_name} {time_str} - {link}\n"
         else:
             text = "Темы в которых нужен номер:\n(пока нет активных тем)"
 
@@ -696,6 +719,90 @@ async def list_sos_words(update: Update, context: ContextTypes.DEFAULT_TYPE):
     words_list = "\n".join(sorted(sos_words))
     await update.message.reply_text(f"Список SOS-слов:\n{words_list}")
 
+async def auto_remove_sos(chat_id: int, topic_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Автоматически снимает SOS через 5 минут"""
+    try:
+        await asyncio.sleep(300)  # 5 минут = 300 секунд
+        
+        # Проверяем, активен ли ещё SOS
+        if (chat_id in active_topics and 
+            topic_id in active_topics[chat_id]):
+            
+            logging.info(f"Автоматическое снятие SOS для темы {topic_id} в чате {chat_id}")
+            
+            # Убираем тему из активных
+            active_topics[chat_id].remove(topic_id)
+            if not active_topics[chat_id]:
+                del active_topics[chat_id]
+            
+            # Убираем время активации
+            if (chat_id, topic_id) in sos_activation_times:
+                del sos_activation_times[(chat_id, topic_id)]
+            
+            # Восстанавливаем название темы
+            await restore_topic_appearance(chat_id, topic_id, context)
+            
+            # Обновляем сообщение в активных темах
+            await update_active_topics_message(chat_id, context)
+            
+            # Отправляем уведомление в тему
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    message_thread_id=topic_id,
+                    text="⏰ SOS режим автоматически снят через 5 минут бездействия"
+                )
+            except Exception as e:
+                logging.error(f"Ошибка при отправке уведомления: {str(e)}")
+        
+        # Убираем задачу из словаря
+        if (chat_id, topic_id) in sos_removal_tasks:
+            del sos_removal_tasks[(chat_id, topic_id)]
+            
+    except asyncio.CancelledError:
+        logging.info(f"Задача автоснятия SOS отменена для темы {topic_id}")
+    except Exception as e:
+        logging.error(f"Ошибка в auto_remove_sos: {str(e)}")
+
+async def update_sos_times(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Обновляет время простоя каждые 30 секунд"""
+    try:
+        while chat_id in active_topics and active_topics[chat_id]:
+            await asyncio.sleep(30)  # Обновляем каждые 30 секунд
+            if chat_id in active_topics and active_topics[chat_id]:
+                await update_active_topics_message(chat_id, context)
+        
+        # Убираем задачу из словаря когда нет активных тем
+        if chat_id in sos_update_tasks:
+            del sos_update_tasks[chat_id]
+            
+    except asyncio.CancelledError:
+        logging.info(f"Задача обновления времени SOS отменена для чата {chat_id}")
+    except Exception as e:
+        logging.error(f"Ошибка в update_sos_times: {str(e)}")
+
+async def restore_topic_appearance(chat_id: int, topic_id: int, context: ContextTypes.DEFAULT_TYPE):
+    """Восстанавливает внешний вид темы после снятия SOS"""
+    try:
+        current_name = topics_dict.get(chat_id, {}).get(topic_id, None)
+        
+        if current_name and current_name.startswith("🚨 "):
+            # Убираем "🚨 " из начала названия
+            new_name = current_name[2:]
+            
+            await context.bot.edit_forum_topic(
+                chat_id=chat_id,
+                message_thread_id=topic_id,
+                name=new_name
+            )
+            
+            # Обновляем наш словарь
+            topics_dict[chat_id][topic_id] = new_name
+            logging.info(f"Восстановлено название темы: {new_name}")
+            
+    except Exception as e:
+        logging.error(f"Ошибка при восстановлении внешнего вида темы: {str(e)}")
+
 async def check_sos_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -720,60 +827,85 @@ async def check_sos_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if sos_found:
         try:
-            # Создаем топик "Активные темы" если его нет
-            await create_active_topics_thread(chat_id, context)
+            # Проверяем, не активен ли уже SOS в этой теме
+            if (chat_id in active_topics and 
+                message_thread_id in active_topics[chat_id]):
+                # SOS уже активен, отменяем старые задачи и создаем новые
+                task_key = (chat_id, message_thread_id)
+                if task_key in sos_removal_tasks:
+                    sos_removal_tasks[task_key].cancel()
+                    del sos_removal_tasks[task_key]
+            else:
+                # Создаем топик "Активные темы" если его нет
+                await create_active_topics_thread(chat_id, context)
 
-            # Добавляем тему в активные
-            if chat_id not in active_topics:
-                active_topics[chat_id] = set()
-            active_topics[chat_id].add(message_thread_id)
+                # Добавляем тему в активные
+                if chat_id not in active_topics:
+                    active_topics[chat_id] = set()
+                active_topics[chat_id].add(message_thread_id)
 
-            # Сначала получаем информацию о текущей теме
-            try:
-                # Пытаемся получить информацию о теме через API
-                chat = await context.bot.get_chat(chat_id)
-                # Сохраняем оригинальную иконку если её ещё нет
-                if (chat_id, message_thread_id) not in original_avatars:
-                    # Устанавливаем None как значение по умолчанию
-                    original_avatars[(chat_id, message_thread_id)] = None
-                    logging.info(f"Сохранена информация о теме {message_thread_id}")
-            except Exception as e:
-                logging.error(f"Ошибка при получении информации о чате: {str(e)}")
-
-            # Пробуем разные варианты SOS emoji
-            success = False
-            for emoji_id in SOS_EMOJI_OPTIONS:
+                # Сначала получаем информацию о текущей теме
                 try:
-                    logging.info(f"Попытка установить иконку с ID: {emoji_id}")
-                    await context.bot.edit_forum_topic(
-                        chat_id=chat_id,
-                        message_thread_id=message_thread_id,
-                        icon_custom_emoji_id=emoji_id
-                    )
-                    logging.info(f"Успешно установлена SOS иконка с ID: {emoji_id}")
-                    success = True
-                    break
+                    # Пытаемся получить информацию о теме через API
+                    chat = await context.bot.get_chat(chat_id)
+                    # Сохраняем оригинальную иконку если её ещё нет
+                    if (chat_id, message_thread_id) not in original_avatars:
+                        # Устанавливаем None как значение по умолчанию
+                        original_avatars[(chat_id, message_thread_id)] = None
+                        logging.info(f"Сохранена информация о теме {message_thread_id}")
                 except Exception as e:
-                    logging.error(f"Ошибка с emoji ID {emoji_id}: {str(e)}")
-                    continue
+                    logging.error(f"Ошибка при получении информации о чате: {str(e)}")
 
-            if not success:
-                # Если не удалось установить custom emoji, попробуем изменить название
-                try:
-                    current_name = topics_dict.get(chat_id, {}).get(message_thread_id, "Тема")
-                    if not current_name.startswith("🚨"):
-                        new_name = f"🚨 {current_name}"
+                # Пробуем разные варианты SOS emoji
+                success = False
+                for emoji_id in SOS_EMOJI_OPTIONS:
+                    try:
+                        logging.info(f"Попытка установить иконку с ID: {emoji_id}")
                         await context.bot.edit_forum_topic(
                             chat_id=chat_id,
                             message_thread_id=message_thread_id,
-                            name=new_name
+                            icon_custom_emoji_id=emoji_id
                         )
-                        # Обновляем наш словарь
-                        if chat_id in topics_dict:
-                            topics_dict[chat_id][message_thread_id] = new_name
-                        logging.info(f"Добавлен SOS эмодзи в название темы: {new_name}")
-                except Exception as e:
-                    logging.error(f"Ошибка при изменении названия темы: {str(e)}")
+                        logging.info(f"Успешно установлена SOS иконка с ID: {emoji_id}")
+                        success = True
+                        break
+                    except Exception as e:
+                        logging.error(f"Ошибка с emoji ID {emoji_id}: {str(e)}")
+                        continue
+
+                if not success:
+                    # Если не удалось установить custom emoji, попробуем изменить название
+                    try:
+                        current_name = topics_dict.get(chat_id, {}).get(message_thread_id, "Тема")
+                        if not current_name.startswith("🚨"):
+                            new_name = f"🚨 {current_name}"
+                            await context.bot.edit_forum_topic(
+                                chat_id=chat_id,
+                                message_thread_id=message_thread_id,
+                                name=new_name
+                            )
+                            # Обновляем наш словарь
+                            if chat_id in topics_dict:
+                                topics_dict[chat_id][message_thread_id] = new_name
+                            logging.info(f"Добавлен SOS эмодзи в название темы: {new_name}")
+                    except Exception as e:
+                        logging.error(f"Ошибка при изменении названия темы: {str(e)}")
+
+            # Сохраняем время активации SOS
+            import time
+            sos_activation_times[(chat_id, message_thread_id)] = time.time()
+
+            # Запускаем задачу автоматического снятия SOS через 5 минут
+            task_key = (chat_id, message_thread_id)
+            sos_removal_tasks[task_key] = asyncio.create_task(
+                auto_remove_sos(chat_id, message_thread_id, context)
+            )
+
+            # Запускаем задачу обновления времени, если её ещё нет для этого чата
+            if chat_id not in sos_update_tasks:
+                sos_update_tasks[chat_id] = asyncio.create_task(
+                    update_sos_times(chat_id, context)
+                )
 
             # Обновляем сообщение в топике "Активные темы"
             await update_active_topics_message(chat_id, context)
@@ -814,6 +946,17 @@ async def restore_topic_icon(update: Update, context: ContextTypes.DEFAULT_TYPE)
             # Убираем тему из активных
             if chat_id in active_topics and message_thread_id in active_topics[chat_id]:
                 active_topics[chat_id].remove(message_thread_id)
+                
+                # Отменяем задачу автоматического снятия SOS
+                task_key = (chat_id, message_thread_id)
+                if task_key in sos_removal_tasks:
+                    sos_removal_tasks[task_key].cancel()
+                    del sos_removal_tasks[task_key]
+                
+                # Убираем время активации
+                if task_key in sos_activation_times:
+                    del sos_activation_times[task_key]
+                
                 # Обновляем сообщение в топике "Активные темы"
                 await update_active_topics_message(chat_id, context)
 
@@ -841,7 +984,7 @@ async def game_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("❌ Закрыть", callback_data='close_games')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
+
     await update.message.reply_text(
         "🎮 Выберите игру:\n\n"
         "🎲 Угадай число - угадайте число от 1 до 100\n"
@@ -862,17 +1005,17 @@ async def stopgame_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     global GAMES_ENABLED
     GAMES_ENABLED = not GAMES_ENABLED
-    
+
     status = "включены" if GAMES_ENABLED else "отключены"
     emoji = "✅" if GAMES_ENABLED else "🚫"
-    
+
     await update.message.reply_text(f"{emoji} Игры {status}")
 
 async def game_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик игровых кнопок"""
     query = update.callback_query
     await query.answer()
-    
+
     if not GAMES_ENABLED and not query.data == 'close_games':
         await query.edit_message_text("🚫 Игры временно отключены администратором")
         return
@@ -904,21 +1047,21 @@ async def start_guess_number_game(update: Update, context: ContextTypes.DEFAULT_
     """Начать игру угадай число"""
     query = update.callback_query
     user_id = query.from_user.id
-    
+
     number = random.randint(1, 100)
     guess_numbers[user_id] = {
         'number': number,
         'attempts': 0,
         'max_attempts': 7
     }
-    
+
     await query.edit_message_text(
         "🎲 Игра 'Угадай число'\n\n"
         "Я загадал число от 1 до 100.\n"
         f"У вас есть {guess_numbers[user_id]['max_attempts']} попыток!\n\n"
         "Напишите ваше число:"
     )
-    
+
     context.user_data['playing_guess'] = True
     return PLAYING_GUESS_NUMBER
 
@@ -926,24 +1069,24 @@ async def handle_guess_number(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Обработать попытку угадать число"""
     if not context.user_data.get('playing_guess'):
         return
-    
+
     user_id = update.effective_user.id
-    
+
     if user_id not in guess_numbers:
         await update.message.reply_text("❌ Игра не найдена. Начните новую игру командой /game")
         context.user_data['playing_guess'] = False
         return ConversationHandler.END
-    
+
     try:
         guess = int(update.message.text)
     except ValueError:
         await update.message.reply_text("❌ Пожалуйста, введите число!")
         return PLAYING_GUESS_NUMBER
-    
+
     game_data = guess_numbers[user_id]
     game_data['attempts'] += 1
     target = game_data['number']
-    
+
     if guess == target:
         await update.message.reply_text(
             f"🎉 Поздравляю! Вы угадали число {target} за {game_data['attempts']} попыток!"
@@ -951,7 +1094,7 @@ async def handle_guess_number(update: Update, context: ContextTypes.DEFAULT_TYPE
         del guess_numbers[user_id]
         context.user_data['playing_guess'] = False
         return ConversationHandler.END
-    
+
     elif game_data['attempts'] >= game_data['max_attempts']:
         await update.message.reply_text(
             f"😔 Игра окончена! Было загадано число {target}.\n"
@@ -960,7 +1103,7 @@ async def handle_guess_number(update: Update, context: ContextTypes.DEFAULT_TYPE
         del guess_numbers[user_id]
         context.user_data['playing_guess'] = False
         return ConversationHandler.END
-    
+
     else:
         hint = "больше" if guess < target else "меньше"
         remaining = game_data['max_attempts'] - game_data['attempts']
@@ -973,19 +1116,19 @@ async def handle_guess_number(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def play_dice_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Игра в кости"""
     query = update.callback_query
-    
+
     user_dice = random.randint(1, 6)
     bot_dice = random.randint(1, 6)
-    
+
     dice_emoji = {1: "⚀", 2: "⚁", 3: "⚂", 4: "⚃", 5: "⚄", 6: "⚅"}
-    
+
     if user_dice > bot_dice:
         result = "🎉 Вы выиграли!"
     elif user_dice < bot_dice:
         result = "😔 Вы проиграли!"
     else:
         result = "🤝 Ничья!"
-    
+
     await query.edit_message_text(
         f"🎯 Игра в кости\n\n"
         f"Ваш результат: {dice_emoji[user_dice]} ({user_dice})\n"
@@ -996,14 +1139,14 @@ async def play_dice_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_rps_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начать игру камень-ножницы-бумага"""
     query = update.callback_query
-    
+
     keyboard = [
         [InlineKeyboardButton("🗿 Камень", callback_data='rps_rock')],
         [InlineKeyboardButton("✂️ Ножницы", callback_data='rps_scissors')],
         [InlineKeyboardButton("📄 Бумага", callback_data='rps_paper')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
+
     await query.edit_message_text(
         "🃏 Камень-Ножницы-Бумага\n\n"
         "Выберите ваш ход:",
@@ -1015,13 +1158,13 @@ async def handle_rps_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user_choice = query.data.split('_')[1]
     bot_choice = random.choice(['rock', 'scissors', 'paper'])
-    
+
     choices = {
         'rock': '🗿 Камень',
         'scissors': '✂️ Ножницы',
         'paper': '📄 Бумага'
     }
-    
+
     # Определяем победителя
     if user_choice == bot_choice:
         result = "🤝 Ничья!"
@@ -1031,7 +1174,7 @@ async def handle_rps_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = "🎉 Вы выиграли!"
     else:
         result = "😔 Вы проиграли!"
-    
+
     await query.edit_message_text(
         f"🃏 Камень-Ножницы-Бумага\n\n"
         f"Ваш выбор: {choices[user_choice]}\n"
@@ -1043,13 +1186,13 @@ async def start_tictactoe_game(update: Update, context: ContextTypes.DEFAULT_TYP
     """Начать игру крестики-нолики"""
     query = update.callback_query
     user_id = query.from_user.id
-    
+
     # Создаем новую игру
     tic_tac_toe_games[user_id] = {
         'board': [' ' for _ in range(9)],
         'current_player': 'X'  # X - игрок, O - бот
     }
-    
+
     await query.edit_message_text(
         "❌ Крестики-нолики\n\n"
         "Вы играете крестиками (X), бот - ноликами (O)\n"
@@ -1061,10 +1204,10 @@ def get_tictactoe_keyboard(user_id: int):
     """Создать клавиатуру для крестиков-ноликов"""
     if user_id not in tic_tac_toe_games:
         return None
-    
+
     board = tic_tac_toe_games[user_id]['board']
     keyboard = []
-    
+
     for i in range(3):
         row = []
         for j in range(3):
@@ -1072,7 +1215,7 @@ def get_tictactoe_keyboard(user_id: int):
             cell = board[pos] if board[pos] != ' ' else '⬜'
             row.append(InlineKeyboardButton(cell, callback_data=f'ttt_{pos}'))
         keyboard.append(row)
-    
+
     return InlineKeyboardMarkup(keyboard)
 
 async def handle_tictactoe_move(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1080,21 +1223,21 @@ async def handle_tictactoe_move(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     user_id = query.from_user.id
     position = int(query.data.split('_')[1])
-    
+
     if user_id not in tic_tac_toe_games:
         await query.answer("Игра не найдена!")
         return
-    
+
     game = tic_tac_toe_games[user_id]
-    
+
     # Проверяем, свободна ли клетка
     if game['board'][position] != ' ':
         await query.answer("Эта клетка уже занята!")
         return
-    
+
     # Ход игрока
     game['board'][position] = 'X'
-    
+
     # Проверяем победу игрока
     winner = check_tictactoe_winner(game['board'])
     if winner == 'X':
@@ -1105,7 +1248,7 @@ async def handle_tictactoe_move(update: Update, context: ContextTypes.DEFAULT_TY
         )
         del tic_tac_toe_games[user_id]
         return
-    
+
     # Проверяем ничью
     if ' ' not in game['board']:
         await query.edit_message_text(
@@ -1115,11 +1258,11 @@ async def handle_tictactoe_move(update: Update, context: ContextTypes.DEFAULT_TY
         )
         del tic_tac_toe_games[user_id]
         return
-    
+
     # Ход бота
     bot_move = get_bot_tictactoe_move(game['board'])
     game['board'][bot_move] = 'O'
-    
+
     # Проверяем победу бота
     winner = check_tictactoe_winner(game['board'])
     if winner == 'O':
@@ -1130,7 +1273,7 @@ async def handle_tictactoe_move(update: Update, context: ContextTypes.DEFAULT_TY
         )
         del tic_tac_toe_games[user_id]
         return
-    
+
     # Проверяем ничью после хода бота
     if ' ' not in game['board']:
         await query.edit_message_text(
@@ -1140,7 +1283,7 @@ async def handle_tictactoe_move(update: Update, context: ContextTypes.DEFAULT_TY
         )
         del tic_tac_toe_games[user_id]
         return
-    
+
     # Продолжаем игру
     await query.edit_message_text(
         "❌ Крестики-нолики\n\n"
@@ -1155,7 +1298,7 @@ def check_tictactoe_winner(board):
         [0, 3, 6], [1, 4, 7], [2, 5, 8],  # вертикали
         [0, 4, 8], [2, 4, 6]              # диагонали
     ]
-    
+
     for combo in winning_combinations:
         if board[combo[0]] == board[combo[1]] == board[combo[2]] != ' ':
             return board[combo[0]]
@@ -1172,15 +1315,15 @@ def get_bot_tictactoe_move(board):
                     board[i] = ' '
                     return i
                 board[i] = ' '
-    
+
     # Если нет срочных ходов, занимаем центр или угол
     if board[4] == ' ':
         return 4
-    
+
     for corner in [0, 2, 6, 8]:
         if board[corner] == ' ':
             return corner
-    
+
     # Иначе любая свободная клетка
     for i in range(9):
         if board[i] == ' ':
@@ -1190,27 +1333,27 @@ async def start_blackjack_game(update: Update, context: ContextTypes.DEFAULT_TYP
     """Начать игру в блекджек"""
     query = update.callback_query
     user_id = query.from_user.id
-    
+
     # Создаем колоду
     suits = ['♠', '♥', '♦', '♣']
     ranks = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
     deck = [(rank, suit) for suit in suits for rank in ranks]
     random.shuffle(deck)
-    
+
     # Раздаем карты
     player_hand = [deck.pop(), deck.pop()]
     dealer_hand = [deck.pop(), deck.pop()]
-    
+
     blackjack_games[user_id] = {
         'deck': deck,
         'player_hand': player_hand,
         'dealer_hand': dealer_hand,
         'game_over': False
     }
-    
+
     player_score = calculate_blackjack_score(player_hand)
     dealer_visible_score = calculate_blackjack_score([dealer_hand[0]])
-    
+
     # Проверяем блекджек у игрока
     if player_score == 21:
         dealer_score = calculate_blackjack_score(dealer_hand)
@@ -1218,7 +1361,7 @@ async def start_blackjack_game(update: Update, context: ContextTypes.DEFAULT_TYP
             result = "🤝 Ничья! У обоих блекджек!"
         else:
             result = "🎉 Блекджек! Вы выиграли!"
-        
+
         await query.edit_message_text(
             f"🃏 Блекджек\n\n"
             f"Ваши карты: {format_blackjack_hand(player_hand)} = {player_score}\n"
@@ -1227,13 +1370,13 @@ async def start_blackjack_game(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         del blackjack_games[user_id]
         return
-    
+
     keyboard = [
         [InlineKeyboardButton("🃏 Взять карту", callback_data='bj_hit')],
         [InlineKeyboardButton("✋ Остановиться", callback_data='bj_stand')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
+
     await query.edit_message_text(
         f"🃏 Блекджек\n\n"
         f"Ваши карты: {format_blackjack_hand(player_hand)} = {player_score}\n"
@@ -1246,7 +1389,7 @@ def calculate_blackjack_score(hand):
     """Вычислить счет в блекджеке"""
     score = 0
     aces = 0
-    
+
     for rank, suit in hand:
         if rank in ['J', 'Q', 'K']:
             score += 10
@@ -1255,12 +1398,12 @@ def calculate_blackjack_score(hand):
             score += 11
         else:
             score += int(rank)
-    
+
     # Обрабатываем тузы
     while score > 21 and aces > 0:
         score -= 10
         aces -= 1
-    
+
     return score
 
 def format_blackjack_hand(hand):
@@ -1272,19 +1415,19 @@ async def handle_blackjack_action(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     user_id = query.from_user.id
     action = query.data.split('_')[1]
-    
+
     if user_id not in blackjack_games:
         await query.answer("Игра не найдена!")
         return
-    
+
     game = blackjack_games[user_id]
-    
+
     if action == 'hit':
         # Игрок берет карту
         card = game['deck'].pop()
         game['player_hand'].append(card)
         player_score = calculate_blackjack_score(game['player_hand'])
-        
+
         if player_score > 21:
             # Перебор у игрока
             dealer_score = calculate_blackjack_score(game['dealer_hand'])
@@ -1296,7 +1439,7 @@ async def handle_blackjack_action(update: Update, context: ContextTypes.DEFAULT_
             )
             del blackjack_games[user_id]
             return
-        
+
         # Продолжаем игру
         dealer_visible_score = calculate_blackjack_score([game['dealer_hand'][0]])
         keyboard = [
@@ -1304,7 +1447,7 @@ async def handle_blackjack_action(update: Update, context: ContextTypes.DEFAULT_
             [InlineKeyboardButton("✋ Остановиться", callback_data='bj_stand')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
+
         await query.edit_message_text(
             f"🃏 Блекджек\n\n"
             f"Ваши карты: {format_blackjack_hand(game['player_hand'])} = {player_score}\n"
@@ -1312,18 +1455,18 @@ async def handle_blackjack_action(update: Update, context: ContextTypes.DEFAULT_
             f"Выберите действие:",
             reply_markup=reply_markup
         )
-    
+
     elif action == 'stand':
         # Игрок останавливается, ход дилера
         player_score = calculate_blackjack_score(game['player_hand'])
-        
+
         # Дилер берет карты до 17
         while calculate_blackjack_score(game['dealer_hand']) < 17:
             card = game['deck'].pop()
             game['dealer_hand'].append(card)
-        
+
         dealer_score = calculate_blackjack_score(game['dealer_hand'])
-        
+
         # Определяем победителя
         if dealer_score > 21:
             result = "🎉 Дилер перебрал! Вы выиграли!"
@@ -1333,7 +1476,7 @@ async def handle_blackjack_action(update: Update, context: ContextTypes.DEFAULT_
             result = "🎉 Вы выиграли!"
         else:
             result = "🤝 Ничья!"
-        
+
         await query.edit_message_text(
             f"🃏 Блекджек\n\n"
             f"Ваши карты: {format_blackjack_hand(game['player_hand'])} = {player_score}\n"
@@ -1346,17 +1489,17 @@ async def start_battleship_game(update: Update, context: ContextTypes.DEFAULT_TY
     """Начать игру в морской бой"""
     query = update.callback_query
     user_id = query.from_user.id
-    
+
     # Создаем поля игрока и бота
     player_field = create_battleship_field()
     bot_field = create_battleship_field()
-    
+
     # Размещаем корабли
     place_battleship_ships(bot_field)
-    
+
     # Создаем видимое поле бота (скрытое)
     bot_visible_field = [['🌊' for _ in range(6)] for _ in range(6)]
-    
+
     battleship_games[user_id] = {
         'player_field': player_field,
         'bot_field': bot_field,
@@ -1367,7 +1510,7 @@ async def start_battleship_game(update: Update, context: ContextTypes.DEFAULT_TY
         'bot_ships': 3,
         'current_turn': 'player'
     }
-    
+
     await query.edit_message_text(
         "🚢 Морской бой\n\n"
         "Разместите 3 корабля на своем поле.\n"
@@ -1393,17 +1536,17 @@ def get_battleship_keyboard(user_id: int, show_player_field: bool = False):
     """Создать клавиатуру для морского боя"""
     if user_id not in battleship_games:
         return None
-    
+
     game = battleship_games[user_id]
     keyboard = []
-    
+
     if show_player_field:
         # Показываем поле игрока для размещения кораблей
         field = game['player_field']
     else:
         # Показываем видимое поле бота для атаки
         field = game['bot_visible_field']
-    
+
     for i in range(6):
         row = []
         for j in range(6):
@@ -1411,29 +1554,29 @@ def get_battleship_keyboard(user_id: int, show_player_field: bool = False):
             callback_data = f'bs_{i}_{j}_{"place" if show_player_field else "attack"}'
             row.append(InlineKeyboardButton(cell, callback_data=callback_data))
         keyboard.append(row)
-    
+
     return InlineKeyboardMarkup(keyboard)
 
 async def handle_battleship_move(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработать ход в морском бою"""
     query = update.callback_query
     user_id = query.from_user.id
-    
+
     if user_id not in battleship_games:
         await query.answer("Игра не найдена!")
         return
-    
+
     game = battleship_games[user_id]
     data_parts = query.data.split('_')
     row, col, action = int(data_parts[1]), int(data_parts[2]), data_parts[3]
-    
+
     if action == 'place':
         # Размещение кораблей игрока
         if game['player_field'][row][col] == '🌊':
             game['player_field'][row][col] = '🚢'
             game['ships_to_place'] -= 1
             game['player_ships'] += 1
-            
+
             if game['ships_to_place'] == 0:
                 # Все корабли размещены, начинаем игру
                 game['placing_ships'] = False
@@ -1452,18 +1595,18 @@ async def handle_battleship_move(update: Update, context: ContextTypes.DEFAULT_T
                 )
         else:
             await query.answer("Эта клетка уже занята!")
-    
+
     elif action == 'attack':
         # Атака игрока
         if game['bot_visible_field'][row][col] not in ['🌊', '🔥']:
             await query.answer("Вы уже стреляли в эту клетку!")
             return
-        
+
         if game['bot_field'][row][col] == '🚢':
             # Попадание
             game['bot_visible_field'][row][col] = '🔥'
             game['bot_ships'] -= 1
-            
+
             if game['bot_ships'] == 0:
                 # Игрок выиграл
                 await query.edit_message_text(
@@ -1473,7 +1616,7 @@ async def handle_battleship_move(update: Update, context: ContextTypes.DEFAULT_T
                 )
                 del battleship_games[user_id]
                 return
-            
+
             await query.edit_message_text(
                 f"🚢 Морской бой\n\n"
                 f"🔥 Попадание! Осталось кораблей противника: {game['bot_ships']}\n"
@@ -1483,7 +1626,7 @@ async def handle_battleship_move(update: Update, context: ContextTypes.DEFAULT_T
         else:
             # Промах
             game['bot_visible_field'][row][col] = '💨'
-            
+
             # Ход бота
             bot_row, bot_col = get_bot_battleship_move(game['player_field'])
             if bot_row is not None:
@@ -1491,7 +1634,7 @@ async def handle_battleship_move(update: Update, context: ContextTypes.DEFAULT_T
                     # Бот попал
                     game['player_field'][bot_row][bot_col] = '🔥'
                     game['player_ships'] -= 1
-                    
+
                     if game['player_ships'] == 0:
                         # Бот выиграл
                         await query.edit_message_text(
@@ -1500,7 +1643,7 @@ async def handle_battleship_move(update: Update, context: ContextTypes.DEFAULT_T
                         )
                         del battleship_games[user_id]
                         return
-                    
+
                     await query.edit_message_text(
                         f"🚢 Морской бой\n\n"
                         f"💨 Промах! Противник попал в ваш корабль!\n"
@@ -1526,7 +1669,7 @@ def get_bot_battleship_move(player_field):
         for j in range(6):
             if player_field[i][j] in ['🌊', '🚢']:
                 available_cells.append((i, j))
-    
+
     if available_cells:
         return random.choice(available_cells)
     return None, None
@@ -1572,7 +1715,15 @@ def main():
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        application.run_polling(allowed_updates=Update.ALL_TYPES)
+    except KeyboardInterrupt:
+        # Отменяем все активные задачи при завершении
+        for task in sos_removal_tasks.values():
+            task.cancel()
+        for task in sos_update_tasks.values():
+            task.cancel()
+        logging.info("Бот остановлен")
 
 if __name__ == '__main__':
     main()
