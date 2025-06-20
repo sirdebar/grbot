@@ -170,7 +170,21 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("🖌 Создать темы с переименованием", callback_data='create_rename_topics')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("👋")
+    greeting_message = await update.message.reply_text("👋")
+    
+    # Планируем удаление ладошки через 0.5 секунд
+    async def delete_greeting():
+        await asyncio.sleep(0.5)
+        try:
+            await context.bot.delete_message(
+                chat_id=greeting_message.chat_id,
+                message_id=greeting_message.message_id
+            )
+        except Exception as e:
+            logging.error(f"Ошибка при удалении приветствия: {str(e)}")
+    
+    asyncio.create_task(delete_greeting())
+    
     await update.message.reply_text(
         'Привет! Я бот для управления темами в группах. Выберите действие:',
         reply_markup=reply_markup
@@ -246,43 +260,60 @@ async def request_topic_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return ConversationHandler.END
 
 async def worker_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    message_thread_id = update.message.message_thread_id
+    
+    # Проверяем, что команда используется в теме
+    if not message_thread_id:
+        await update.message.reply_text("Команда /worker должна использоваться в теме")
+        return
+    
     if not context.args:
-        await update.message.reply_text("Использование: /worker название_темы @user1 @user2 ...")
+        await update.message.reply_text("Использование: /worker @user1 @user2 ...")
         return
 
-    topic_name = context.args[0]
-    users = context.args[1:]
+    users = context.args
 
     if not users:
         await update.message.reply_text("Необходимо указать хотя бы одного пользователя")
         return
 
-    chat = await context.bot.get_chat(update.message.chat_id)
+    chat = await context.bot.get_chat(chat_id)
 
     if not await check_forum_support(chat.id, context):
         await update.message.reply_text("Эта группа не поддерживает темы")
         return
 
-    topic_id = None
-    for tid, name in topics_dict.get(chat.id, {}).items():
-        if name == topic_name:
-            topic_id = tid
-            break
-
-    if not topic_id:
-        await update.message.reply_text(f"Тема '{topic_name}' не найдена")
-        return
-
-    user_mentions = " ".join(users)
-    await context.bot.send_message(
-        chat_id=chat.id,
-        message_thread_id=topic_id,
-        text=f"Внимание! {user_mentions}"
-    )
-
-    if chat.id not in workers_dict:
-        workers_dict[chat.id] = {}
-    workers_dict[chat.id][topic_id] = users
+    # Инициализируем словари если их нет
+    if chat_id not in workers_dict:
+        workers_dict[chat_id] = {}
+    
+    # Добавляем или обновляем воркеров для текущей темы
+    if message_thread_id not in workers_dict[chat_id]:
+        workers_dict[chat_id][message_thread_id] = []
+    
+    # Добавляем новых воркеров к существующим (избегаем дубликатов)
+    existing_workers = set(workers_dict[chat_id][message_thread_id])
+    new_workers = []
+    
+    for user in users:
+        if user not in existing_workers:
+            workers_dict[chat_id][message_thread_id].append(user)
+            new_workers.append(user)
+    
+    if new_workers:
+        new_workers_text = " ".join(new_workers)
+        all_workers_text = " ".join(workers_dict[chat_id][message_thread_id])
+        
+        topic_name = topics_dict.get(chat_id, {}).get(message_thread_id, f"Тема {message_thread_id}")
+        
+        await update.message.reply_text(
+            f"✅ Воркеры добавлены в тему '{topic_name}'\n"
+            f"Новые воркеры: {new_workers_text}\n"
+            f"Все воркеры темы: {all_workers_text}"
+        )
+    else:
+        await update.message.reply_text("Все указанные пользователи уже являются воркерами этой темы")
 
 async def create_topic_with_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -431,14 +462,38 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
+    chat_id = update.message.chat_id
+    message_thread_id = update.message.message_thread_id
+
+    # Проверяем, не в теме ли для переименования написано сообщение
+    if (chat_id in rename_topics_dict and 
+        message_thread_id in rename_topics_dict[chat_id]):
+        # Удаляем ВСЕ сообщения в темах переименования, кроме ответов на запрос имени от бота
+        is_reply_to_name_request = False
+        
+        if update.message.reply_to_message:
+            # Проверяем, является ли это ответом на сообщение с запросом имени
+            reply_text = update.message.reply_to_message.text
+            if (update.message.reply_to_message.from_user.is_bot and
+                reply_text and "Введите своё имя" in reply_text):
+                is_reply_to_name_request = True
+        
+        if not is_reply_to_name_request:
+            try:
+                await context.bot.delete_message(
+                    chat_id=chat_id,
+                    message_id=update.message.message_id
+                )
+                logging.info(f"Удалено сообщение в теме для переименования: {chat_id}/{message_thread_id}")
+            except Exception as e:
+                logging.error(f"Ошибка при удалении сообщения в теме переименования: {str(e)}")
+            return
+
     # Сначала проверяем SOS слова
     await check_sos_word(update, context)
 
     # Затем проверяем специальные команды
     if update.message.text.lower() == "номер":
-        chat_id = update.message.chat_id
-        message_thread_id = update.message.message_thread_id
-
         if chat_id in workers_dict and message_thread_id in workers_dict[chat_id]:
             workers = workers_dict[chat_id][message_thread_id]
             user_mentions = " ".join(workers)
@@ -909,6 +964,92 @@ async def check_sos_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Обновляем сообщение в топике "Активные темы"
             await update_active_topics_message(chat_id, context)
+
+            # Проверяем, есть ли назначенные воркеры для этой темы
+            if chat_id in workers_dict and message_thread_id in workers_dict[chat_id]:
+                workers = workers_dict[chat_id][message_thread_id]
+                topic_name = topics_dict.get(chat_id, {}).get(message_thread_id, f"Тема {message_thread_id}")
+                
+                # Создаем ссылку на топик
+                try:
+                    chat = await context.bot.get_chat(chat_id)
+                    if chat.username:
+                        link = f"https://t.me/{chat.username}/{message_thread_id}"
+                    else:
+                        # Для приватных чатов используем другой формат
+                        link = f"https://t.me/c/{str(chat_id)[4:]}/{message_thread_id}"
+                    
+                    # Отправляем уведомления воркерам в личные сообщения
+                    for worker in workers:
+                        # Убираем @ из упоминания пользователя, если есть
+                        username = worker.replace('@', '') if worker.startswith('@') else worker
+                        
+                        try:
+                            notification_text = (
+                                f"🚨 ВНИМАНИЕ! Нужен номер в теме '{topic_name}'\n"
+                                f"Ссылка: {link}"
+                            )
+                            
+                            # Пытаемся найти пользователя по username и отправить ЛС
+                            try:
+                                # Получаем информацию о участниках чата для поиска user_id по username
+                                chat_members = await context.bot.get_chat_administrators(chat_id)
+                                user_id = None
+                                
+                                # Ищем user_id по username среди администраторов
+                                for member in chat_members:
+                                    if member.user.username and member.user.username.lower() == username.lower():
+                                        user_id = member.user.id
+                                        break
+                                
+                                # Если не нашли среди админов, пробуем среди обычных участников
+                                # (это ограниченная функция, работает не во всех группах)
+                                if not user_id:
+                                    try:
+                                        # Для больших групп это может не работать
+                                        chat_member = await context.bot.get_chat_member(chat_id, f"@{username}")
+                                        if chat_member:
+                                            user_id = chat_member.user.id
+                                    except:
+                                        pass
+                                
+                                if user_id:
+                                    # Пытаемся отправить ЛС
+                                    await context.bot.send_message(
+                                        chat_id=user_id,
+                                        text=notification_text,
+                                        disable_web_page_preview=True
+                                    )
+                                    logging.info(f"Отправлено ЛС воркеру {worker} (ID: {user_id})")
+                                else:
+                                    # Если не смогли найти user_id, отправляем в группу
+                                    await context.bot.send_message(
+                                        chat_id=chat_id,
+                                        message_thread_id=message_thread_id,
+                                        text=f"🚨 ВНИМАНИЕ! {worker} - нужен номер!",
+                                        disable_web_page_preview=True
+                                    )
+                                    logging.info(f"Не удалось найти user_id для {worker}, отправлено в группу")
+                                    
+                            except Exception as dm_error:
+                                # Если не удалось отправить ЛС (пользователь не начинал диалог с ботом)
+                                logging.warning(f"Не удалось отправить ЛС воркеру {worker}: {str(dm_error)}")
+                                # Отправляем в группу как fallback
+                                await context.bot.send_message(
+                                    chat_id=chat_id,
+                                    message_thread_id=message_thread_id,
+                                    text=f"🚨 ВНИМАНИЕ! {worker} - нужен номер!",
+                                    disable_web_page_preview=True
+                                )
+                                logging.info(f"Отправлено в группу как fallback для {worker}")
+                            
+                        except Exception as e:
+                            logging.error(f"Общая ошибка при отправке уведомления воркеру {worker}: {str(e)}")
+                    
+                    logging.info(f"Отправлены уведомления воркерам для темы {message_thread_id}")
+                    
+                except Exception as e:
+                    logging.error(f"Ошибка при отправке уведомлений воркерам: {str(e)}")
 
         except Exception as e:
             logging.error(f"Общая ошибка в check_sos_word: {str(e)}")
