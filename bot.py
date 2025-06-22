@@ -794,21 +794,8 @@ async def auto_remove_sos(chat_id: int, topic_id: int, context: ContextTypes.DEF
             if (chat_id, topic_id) in sos_activation_times:
                 del sos_activation_times[(chat_id, topic_id)]
             
-            # Восстанавливаем название темы
-            await restore_topic_appearance(chat_id, topic_id, context)
-            
             # Обновляем сообщение в активных темах
             await update_active_topics_message(chat_id, context)
-            
-            # Отправляем уведомление в тему
-            try:
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    message_thread_id=topic_id,
-                    text="⏰ SOS режим автоматически снят через 5 минут бездействия"
-                )
-            except Exception as e:
-                logging.error(f"Ошибка при отправке уведомления: {str(e)}")
         
         # Убираем задачу из словаря
         if (chat_id, topic_id) in sos_removal_tasks:
@@ -836,27 +823,7 @@ async def update_sos_times(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Ошибка в update_sos_times: {str(e)}")
 
-async def restore_topic_appearance(chat_id: int, topic_id: int, context: ContextTypes.DEFAULT_TYPE):
-    """Восстанавливает внешний вид темы после снятия SOS"""
-    try:
-        current_name = topics_dict.get(chat_id, {}).get(topic_id, None)
-        
-        if current_name and current_name.startswith("🚨 "):
-            # Убираем "🚨 " из начала названия
-            new_name = current_name[2:]
-            
-            await context.bot.edit_forum_topic(
-                chat_id=chat_id,
-                message_thread_id=topic_id,
-                name=new_name
-            )
-            
-            # Обновляем наш словарь
-            topics_dict[chat_id][topic_id] = new_name
-            logging.info(f"Восстановлено название темы: {new_name}")
-            
-    except Exception as e:
-        logging.error(f"Ошибка при восстановлении внешнего вида темы: {str(e)}")
+
 
 async def check_sos_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
@@ -898,53 +865,6 @@ async def check_sos_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if chat_id not in active_topics:
                     active_topics[chat_id] = set()
                 active_topics[chat_id].add(message_thread_id)
-
-                # Сначала получаем информацию о текущей теме
-                try:
-                    # Пытаемся получить информацию о теме через API
-                    chat = await context.bot.get_chat(chat_id)
-                    # Сохраняем оригинальную иконку если её ещё нет
-                    if (chat_id, message_thread_id) not in original_avatars:
-                        # Устанавливаем None как значение по умолчанию
-                        original_avatars[(chat_id, message_thread_id)] = None
-                        logging.info(f"Сохранена информация о теме {message_thread_id}")
-                except Exception as e:
-                    logging.error(f"Ошибка при получении информации о чате: {str(e)}")
-
-                # Пробуем разные варианты SOS emoji
-                success = False
-                for emoji_id in SOS_EMOJI_OPTIONS:
-                    try:
-                        logging.info(f"Попытка установить иконку с ID: {emoji_id}")
-                        await context.bot.edit_forum_topic(
-                            chat_id=chat_id,
-                            message_thread_id=message_thread_id,
-                            icon_custom_emoji_id=emoji_id
-                        )
-                        logging.info(f"Успешно установлена SOS иконка с ID: {emoji_id}")
-                        success = True
-                        break
-                    except Exception as e:
-                        logging.error(f"Ошибка с emoji ID {emoji_id}: {str(e)}")
-                        continue
-
-                if not success:
-                    # Если не удалось установить custom emoji, попробуем изменить название
-                    try:
-                        current_name = topics_dict.get(chat_id, {}).get(message_thread_id, "Тема")
-                        if not current_name.startswith("🚨"):
-                            new_name = f"🚨 {current_name}"
-                            await context.bot.edit_forum_topic(
-                                chat_id=chat_id,
-                                message_thread_id=message_thread_id,
-                                name=new_name
-                            )
-                            # Обновляем наш словарь
-                            if chat_id in topics_dict:
-                                topics_dict[chat_id][message_thread_id] = new_name
-                            logging.info(f"Добавлен SOS эмодзи в название темы: {new_name}")
-                    except Exception as e:
-                        logging.error(f"Ошибка при изменении названия темы: {str(e)}")
 
             # Сохраняем время активации SOS
             import time
@@ -1054,60 +974,7 @@ async def check_sos_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.error(f"Общая ошибка в check_sos_word: {str(e)}")
 
-async def restore_topic_icon(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
-    message_thread_id = update.message.message_thread_id
 
-    if not message_thread_id:
-        await update.message.reply_text("Эта команда должна использоваться в теме")
-        return
-
-    # Получаем текущее название темы
-    current_name = topics_dict.get(chat_id, {}).get(message_thread_id, None)
-
-    if not current_name:
-        await update.message.reply_text("Информация о теме не найдена")
-        return
-
-    # Проверяем, начинается ли название с 🚨
-    if current_name.startswith("🚨 "):
-        try:
-            # Убираем "🚨 " из начала названия
-            new_name = current_name[2:]  # Убираем первые 3 символа: "🚨 "
-
-            await context.bot.edit_forum_topic(
-                chat_id=chat_id,
-                message_thread_id=message_thread_id,
-                name=new_name
-            )
-
-            # Обновляем наш словарь
-            topics_dict[chat_id][message_thread_id] = new_name
-
-            # Убираем тему из активных
-            if chat_id in active_topics and message_thread_id in active_topics[chat_id]:
-                active_topics[chat_id].remove(message_thread_id)
-                
-                # Отменяем задачу автоматического снятия SOS
-                task_key = (chat_id, message_thread_id)
-                if task_key in sos_removal_tasks:
-                    sos_removal_tasks[task_key].cancel()
-                    del sos_removal_tasks[task_key]
-                
-                # Убираем время активации
-                if task_key in sos_activation_times:
-                    del sos_activation_times[task_key]
-                
-                # Обновляем сообщение в топике "Активные темы"
-                await update_active_topics_message(chat_id, context)
-
-            await update.message.reply_text(f"SOS эмодзи убран. Новое название: {new_name}")
-
-        except Exception as e:
-            logging.error(f"Ошибка при восстановлении названия темы: {str(e)}")
-            await update.message.reply_text("Произошла ошибка при восстановлении названия темы.")
-    else:
-        await update.message.reply_text("В названии темы нет SOS эмодзи для удаления")
 
 async def game_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать меню игр"""
@@ -1848,7 +1715,7 @@ def main():
     application.add_handler(CommandHandler("gadd", add_sos_word))
     application.add_handler(CommandHandler("gdel", delete_sos_word))
     application.add_handler(CommandHandler("gall", list_sos_words))
-    application.add_handler(CommandHandler("grestore", restore_topic_icon))
+    
     application.add_handler(CommandHandler("game", game_command))
     application.add_handler(CommandHandler("stopgame", stopgame_command))
     application.add_handler(conv_handler)
