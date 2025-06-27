@@ -57,6 +57,8 @@ guess_numbers = {}
 tic_tac_toe_games = {}
 blackjack_games = {}
 battleship_games = {}
+# Словарь для хранения ограниченных топиков {chat_id: {topic_id: [allowed_users]}}
+restricted_topics = {}
 
 async def create_active_topics_thread(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     """Создает топик 'Активные темы' если его нет"""
@@ -315,6 +317,61 @@ async def worker_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Все указанные пользователи уже являются воркерами этой темы")
 
+async def only_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    message_thread_id = update.message.message_thread_id
+    user_id = update.effective_user.id
+    
+    # Проверяем, что команда используется в теме
+    if not message_thread_id:
+        await update.message.reply_text("Команда /only должна использоваться в теме")
+        return
+    
+    # Проверяем, является ли пользователь администратором
+    if not await is_admin(chat_id, user_id, context):
+        await update.message.reply_text("Эта команда доступна только администраторам")
+        return
+    
+    if not context.args:
+        # Если нет аргументов, показываем текущие ограничения или убираем их
+        if (chat_id in restricted_topics and 
+            message_thread_id in restricted_topics[chat_id]):
+            # Убираем ограничения
+            del restricted_topics[chat_id][message_thread_id]
+            if not restricted_topics[chat_id]:
+                del restricted_topics[chat_id]
+            
+            topic_name = topics_dict.get(chat_id, {}).get(message_thread_id, f"Тема {message_thread_id}")
+            await update.message.reply_text(
+                f"🔓 Ограничения доступа к теме '{topic_name}' сняты.\n"
+                "Теперь все пользователи могут писать в этой теме."
+            )
+        else:
+            await update.message.reply_text(
+                "Использование: /only @user1 @user2 ... - ограничить доступ к теме\n"
+                "/only - снять ограничения с темы"
+            )
+        return
+
+    users = context.args
+
+    # Инициализируем словарь если его нет
+    if chat_id not in restricted_topics:
+        restricted_topics[chat_id] = {}
+    
+    # Устанавливаем ограничения для темы
+    restricted_topics[chat_id][message_thread_id] = users
+    
+    users_text = " ".join(users)
+    topic_name = topics_dict.get(chat_id, {}).get(message_thread_id, f"Тема {message_thread_id}")
+    
+    await update.message.reply_text(
+        f"🔒 Доступ к теме '{topic_name}' ограничен.\n"
+        f"Писать могут только: {users_text}\n"
+        f"Администраторы могут писать всегда.\n\n"
+        f"Для снятия ограничений используйте: /only"
+    )
+
 async def create_topic_with_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat = await context.bot.get_chat(update.message.chat_id)
@@ -464,6 +521,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     chat_id = update.message.chat_id
     message_thread_id = update.message.message_thread_id
+    user_id = update.effective_user.id
+    username = update.effective_user.username
+
+    # Проверяем ограничения доступа к топику (только если есть message_thread_id)
+    if message_thread_id:
+        if (chat_id in restricted_topics and 
+            message_thread_id in restricted_topics[chat_id]):
+            
+            # Проверяем, является ли пользователь администратором
+            is_user_admin = await is_admin(chat_id, user_id, context)
+            
+            if not is_user_admin:
+                # Проверяем, есть ли пользователь в списке разрешенных
+                allowed_users = restricted_topics[chat_id][message_thread_id]
+                user_allowed = False
+                
+                # Проверяем по username (с @ и без)
+                if username:
+                    user_allowed = (f"@{username}" in allowed_users or 
+                                  username in allowed_users)
+                
+                # Проверяем по user_id (если указан в формате @123456789)
+                if not user_allowed:
+                    user_id_mention = f"@{user_id}"
+                    user_allowed = user_id_mention in allowed_users
+                
+                if not user_allowed:
+                    # Пользователь не имеет права писать в этом топике
+                    try:
+                        await context.bot.delete_message(
+                            chat_id=chat_id,
+                            message_id=update.message.message_id
+                        )
+                        logging.info(f"Удалено сообщение от неразрешенного пользователя в ограниченном топике: {chat_id}/{message_thread_id}")
+                    except Exception as e:
+                        logging.error(f"Ошибка при удалении сообщения в ограниченном топике: {str(e)}")
+                    return
 
     # Проверяем, не в теме ли для переименования написано сообщение
     if (chat_id in rename_topics_dict and 
@@ -1712,6 +1806,7 @@ def main():
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("worker", worker_command))
+    application.add_handler(CommandHandler("only", only_command))
     application.add_handler(CommandHandler("gadd", add_sos_word))
     application.add_handler(CommandHandler("gdel", delete_sos_word))
     application.add_handler(CommandHandler("gall", list_sos_words))
