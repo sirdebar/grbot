@@ -8,7 +8,7 @@ from telegram.error import RetryAfter
 from dotenv import load_dotenv
 
 load_dotenv()
-TOKEN = os.getenv('TELEGRAM_TOKEN')
+TOKEN = os.getenv('TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
 GAMES_ENABLED = os.getenv('GAMES_ENABLED', 'true').lower() == 'true'
 
@@ -59,6 +59,8 @@ blackjack_games = {}
 battleship_games = {}
 # Словарь для хранения ограниченных топиков {chat_id: {topic_id: [allowed_users]}}
 restricted_topics = {}
+# Список дополнительных админов (кроме главного ADMIN_ID)
+admin_list = set()
 
 async def create_active_topics_thread(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     """Создает топик 'Активные темы' если его нет"""
@@ -121,7 +123,7 @@ async def update_active_topics_message(chat_id: int, context: ContextTypes.DEFAU
 
             for active_topic_id in active_topics[chat_id]:
                 topic_name = topics_dict.get(chat_id, {}).get(active_topic_id, f"Тема {active_topic_id}")
-                
+
                 # Вычисляем время простоя
                 activation_time = sos_activation_times.get((chat_id, active_topic_id))
                 if activation_time:
@@ -137,7 +139,7 @@ async def update_active_topics_message(chat_id: int, context: ContextTypes.DEFAU
                             time_str = f"({minutes} минут простой)"
                 else:
                     time_str = "(время неизвестно)"
-                
+
                 # Создаем ссылку на топик
                 if chat.username:
                     link = f"https://t.me/{chat.username}/{active_topic_id}"
@@ -173,7 +175,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     greeting_message = await update.message.reply_text("👋")
-    
+
     # Планируем удаление ладошки через 0.5 секунд
     async def delete_greeting():
         await asyncio.sleep(0.5)
@@ -184,9 +186,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             logging.error(f"Ошибка при удалении приветствия: {str(e)}")
-    
+
     asyncio.create_task(delete_greeting())
-    
+
     await update.message.reply_text(
         'Привет! Я бот для управления темами в группах. Выберите действие:',
         reply_markup=reply_markup
@@ -194,6 +196,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    user_id = update.effective_user.id
+    chat_id = query.message.chat_id
+
+    # Проверяем административные права для всех действий кроме confirm_rename
+    if not query.data.startswith('confirm_rename_'):
+        if not await is_admin(chat_id, user_id, context):
+            await query.answer("❌ У вас нет прав администратора", show_alert=True)
+            return
+
     await query.answer()
 
     if query.data == 'list_topics':
@@ -226,8 +237,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['confirmation_message_id'] = query.message.message_id
 
         # Отправляем сообщение с запросом имени и сохраняем его ID
-        message = await query.message.reply_text("Введите своё имя:")
+        message = await query.message.reply_text(
+            "⚠️ Введите имя ответом на сообщение — это необходимо для присвоения названия теме.\n"
+            "> ⛔️ Без этого тема останется в статусе «Без названия» и будет неактивной.",
+            parse_mode='Markdown'
+        )
         context.user_data['request_name_message_id'] = message.message_id
+        
+        # Отправляем дополнительное сообщение
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            message_thread_id=topic_id,
+            text="♻️ До присвоения имени тема закрыта для сообщений (кроме администраторов).\n"
+                 "🚫 Запрещается занимать более двух тем, вне зависимости от чатов."
+        )
 
         return WAITING_FOR_RENAME
 
@@ -264,12 +287,12 @@ async def request_topic_name(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def worker_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     message_thread_id = update.message.message_thread_id
-    
+
     # Проверяем, что команда используется в теме
     if not message_thread_id:
         await update.message.reply_text("Команда /worker должна использоваться в теме")
         return
-    
+
     if not context.args:
         await update.message.reply_text("Использование: /worker @user1 @user2 ...")
         return
@@ -289,26 +312,26 @@ async def worker_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Инициализируем словари если их нет
     if chat_id not in workers_dict:
         workers_dict[chat_id] = {}
-    
+
     # Добавляем или обновляем воркеров для текущей темы
     if message_thread_id not in workers_dict[chat_id]:
         workers_dict[chat_id][message_thread_id] = []
-    
+
     # Добавляем новых воркеров к существующим (избегаем дубликатов)
     existing_workers = set(workers_dict[chat_id][message_thread_id])
     new_workers = []
-    
+
     for user in users:
         if user not in existing_workers:
             workers_dict[chat_id][message_thread_id].append(user)
             new_workers.append(user)
-    
+
     if new_workers:
         new_workers_text = " ".join(new_workers)
         all_workers_text = " ".join(workers_dict[chat_id][message_thread_id])
-        
+
         topic_name = topics_dict.get(chat_id, {}).get(message_thread_id, f"Тема {message_thread_id}")
-        
+
         await update.message.reply_text(
             f"✅ Воркеры добавлены в тему '{topic_name}'\n"
             f"Новые воркеры: {new_workers_text}\n"
@@ -321,17 +344,17 @@ async def only_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
     message_thread_id = update.message.message_thread_id
     user_id = update.effective_user.id
-    
+
     # Проверяем, что команда используется в теме
     if not message_thread_id:
         await update.message.reply_text("Команда /only должна использоваться в теме")
         return
-    
+
     # Проверяем, является ли пользователь администратором
     if not await is_admin(chat_id, user_id, context):
         await update.message.reply_text("Эта команда доступна только администраторам")
         return
-    
+
     if not context.args:
         # Если нет аргументов, показываем текущие ограничения или убираем их
         if (chat_id in restricted_topics and 
@@ -340,7 +363,7 @@ async def only_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             del restricted_topics[chat_id][message_thread_id]
             if not restricted_topics[chat_id]:
                 del restricted_topics[chat_id]
-            
+
             topic_name = topics_dict.get(chat_id, {}).get(message_thread_id, f"Тема {message_thread_id}")
             await update.message.reply_text(
                 f"🔓 Ограничения доступа к теме '{topic_name}' сняты.\n"
@@ -358,19 +381,86 @@ async def only_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Инициализируем словарь если его нет
     if chat_id not in restricted_topics:
         restricted_topics[chat_id] = {}
-    
+
     # Устанавливаем ограничения для темы
     restricted_topics[chat_id][message_thread_id] = users
-    
+
     users_text = " ".join(users)
     topic_name = topics_dict.get(chat_id, {}).get(message_thread_id, f"Тема {message_thread_id}")
-    
+
     await update.message.reply_text(
         f"🔒 Доступ к теме '{topic_name}' ограничен.\n"
         f"Писать могут только: {users_text}\n"
         f"Администраторы могут писать всегда.\n\n"
         f"Для снятия ограничений используйте: /only"
     )
+
+async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.message.chat_id
+    message_thread_id = update.message.message_thread_id
+    user_id = update.effective_user.id
+
+    # Проверяем, что команда используется в теме
+    if not message_thread_id:
+        await update.message.reply_text("Команда /new должна использоваться в теме")
+        return
+
+    # Проверяем, является ли пользователь администратором
+    if not await is_admin(chat_id, user_id, context):
+        await update.message.reply_text("Эта команда доступна только администраторам")
+        return
+
+    # Проверяем, есть ли эта тема в словаре тем
+    if (chat_id not in topics_dict or 
+        message_thread_id not in topics_dict[chat_id]):
+        await update.message.reply_text("Тема не найдена в базе данных")
+        return
+
+    current_name = topics_dict[chat_id][message_thread_id]
+
+    # Проверяем, что это тема с номером (содержит ":")
+    if ":" not in current_name:
+        await update.message.reply_text("Эта команда работает только с пронумерованными темами")
+        return
+
+    # Получаем номер темы
+    number = current_name.split(":")[0]
+    new_name = f"{number}:Без названия"
+
+    try:
+        # Переименовываем тему обратно в "Без названия"
+        await context.bot.edit_forum_topic(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            name=new_name
+        )
+
+        # Обновляем словарь тем
+        topics_dict[chat_id][message_thread_id] = new_name
+
+        # Добавляем тему в список тем для переименования
+        if chat_id not in rename_topics_dict:
+            rename_topics_dict[chat_id] = set()
+        rename_topics_dict[chat_id].add(message_thread_id)
+
+        # Создаем новое сообщение с галочкой для переименования
+        keyboard = [[InlineKeyboardButton("✅", callback_data=f'confirm_rename_{message_thread_id}')]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+            text="🌏 Чтобы задать название темы, сначала укажите своё имя.\n"
+                 "ℹ️ Не забудьте нажать на галочку под сообщением",
+            reply_markup=reply_markup
+        )
+        
+        
+
+        await update.message.reply_text(f"✅ Тема сброшена в режим переименования: {new_name}")
+
+    except Exception as e:
+        await update.message.reply_text(f"Ошибка при сбросе темы: {str(e)}")
 
 async def create_topic_with_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -528,25 +618,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if message_thread_id:
         if (chat_id in restricted_topics and 
             message_thread_id in restricted_topics[chat_id]):
-            
+
             # Проверяем, является ли пользователь администратором
             is_user_admin = await is_admin(chat_id, user_id, context)
-            
+
             if not is_user_admin:
                 # Проверяем, есть ли пользователь в списке разрешенных
                 allowed_users = restricted_topics[chat_id][message_thread_id]
                 user_allowed = False
-                
+
                 # Проверяем по username (с @ и без)
                 if username:
                     user_allowed = (f"@{username}" in allowed_users or 
                                   username in allowed_users)
-                
+
                 # Проверяем по user_id (если указан в формате @123456789)
                 if not user_allowed:
                     user_id_mention = f"@{user_id}"
                     user_allowed = user_id_mention in allowed_users
-                
+
                 if not user_allowed:
                     # Пользователь не имеет права писать в этом топике
                     try:
@@ -562,16 +652,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Проверяем, не в теме ли для переименования написано сообщение
     if (chat_id in rename_topics_dict and 
         message_thread_id in rename_topics_dict[chat_id]):
-        # Удаляем ВСЕ сообщения в темах переименования, кроме ответов на запрос имени от бота
+        # Удаляем ВСЕ сообщения в темах переименования, кроме ответов на запрос имени от пользователей
         is_reply_to_name_request = False
-        
-        if update.message.reply_to_message:
+
+        # Проверяем только сообщения от пользователей (не от бота)
+        if (not update.message.from_user.is_bot and 
+            update.message.reply_to_message):
             # Проверяем, является ли это ответом на сообщение с запросом имени
             reply_text = update.message.reply_to_message.text
             if (update.message.reply_to_message.from_user.is_bot and
-                reply_text and "Введите своё имя" in reply_text):
+                reply_text and "Введите имя ответом на сообщение" in reply_text):
                 is_reply_to_name_request = True
-        
+
         if not is_reply_to_name_request:
             try:
                 await context.bot.delete_message(
@@ -712,8 +804,8 @@ async def create_rename_topics(update: Update, context: ContextTypes.DEFAULT_TYP
                     await context.bot.send_message(
                         chat_id=chat.id,
                         message_thread_id=topic.message_thread_id,
-                        text="Чтобы изменить название темы, введите своё имя.\n"
-                             "Перед этим нажмите на галочку ниже.",
+                        text="🌏 Чтобы задать название темы, сначала укажите своё имя.\n"
+                             "ℹ️ Не забудьте нажать на галочку под сообщением",
                         reply_markup=reply_markup
                     )
                 except RetryAfter as e:
@@ -721,8 +813,8 @@ async def create_rename_topics(update: Update, context: ContextTypes.DEFAULT_TYP
                     await context.bot.send_message(
                         chat_id=chat.id,
                         message_thread_id=topic.message_thread_id,
-                        text="Чтобы изменить название темы, введите своё имя.\n"
-                             "Перед этим нажмите на галочку ниже.",
+                        text="🌏 Чтобы задать название темы, сначала укажите своё имя.\n"
+                             "ℹ️ Не забудьте нажать на галочку под сообщением",
                         reply_markup=reply_markup
                     )
 
@@ -789,6 +881,38 @@ async def rename_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rename_topics_dict[chat_id].discard(topic_id)
 
         await update.message.reply_text(f"Тема успешно переименована в {number}:{new_name}")
+        
+        # Отправляем уведомление в топик
+        chat = await context.bot.get_chat(chat_id)
+        if chat.username:
+            topic_link = f"https://t.me/{chat.username}/{topic_id}"
+        else:
+            topic_link = f"https://t.me/c/{str(chat_id)[4:]}/{topic_id}"
+            
+        topic_info_message = (
+            f"Темы 🆔: {topic_id}\n"
+            f"Наименование: {number}:{new_name}\n"
+            f"Ссылка 🔗 на тему: {topic_link}"
+        )
+        
+        # Отправляем в топик
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=topic_id,
+            text=topic_info_message,
+            disable_web_page_preview=True
+        )
+        
+        # Отправляем главному админу в ЛС (если ADMIN_ID настроен)
+        if ADMIN_ID != 0:
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"Новая тема переименована:\n\n{topic_info_message}",
+                    disable_web_page_preview=True
+                )
+            except Exception as e:
+                logging.error(f"Не удалось отправить уведомление админу: {str(e)}")
 
         # Удаляем сообщения бота
         try:
@@ -817,6 +941,15 @@ async def rename_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def is_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
+        # Проверяем, является ли пользователь главным админом
+        if user_id == ADMIN_ID:
+            return True
+
+        # Проверяем, есть ли пользователь в списке дополнительных админов
+        if user_id in admin_list:
+            return True
+
+        # Проверяем статус в чате
         chat_member = await context.bot.get_chat_member(chat_id, user_id)
         return chat_member.status in ['creator', 'administrator']
     except Exception:
@@ -868,33 +1001,130 @@ async def list_sos_words(update: Update, context: ContextTypes.DEFAULT_TYPE):
     words_list = "\n".join(sorted(sos_words))
     await update.message.reply_text(f"Список SOS-слов:\n{words_list}")
 
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Управление списком дополнительных администраторов"""
+    user_id = update.effective_user.id
+
+    # Отладочная информация
+    logging.info(f"admin_command: user_id={user_id}, ADMIN_ID={ADMIN_ID}")
+
+    # Только главный админ может управлять списком администраторов
+    if ADMIN_ID == 0:
+        await update.message.reply_text("❌ ADMIN_ID не настроен. Установите переменную окружения ADMIN_ID")
+        return
+
+    if user_id != ADMIN_ID:
+        await update.message.reply_text(f"❌ Эта команда доступна только главному администратору (ID: {ADMIN_ID})")
+        return
+
+    if not context.args:
+        # Показываем текущий список админов
+        if admin_list:
+            admin_text = "\n".join([f"• {admin_id}" for admin_id in sorted(admin_list)])
+            await update.message.reply_text(
+                f"📋 Список дополнительных администраторов:\n{admin_text}\n\n"
+                "Использование:\n"
+                "/admin add <user_id> - добавить админа\n"
+                "/admin del <user_id> - удалить админа\n"
+                "/admin list - показать список"
+            )
+        else:
+            await update.message.reply_text(
+                "📋 Список дополнительных администраторов пуст\n\n"
+                "Использование:\n"
+                "/admin add <user_id> - добавить админа\n"
+                "/admin del <user_id> - удалить админа\n"
+                "/admin list - показать список"
+            )
+        return
+
+    action = context.args[0].lower()
+
+    if action == "list":
+        if admin_list:
+            admin_text = "\n".join([f"• {admin_id}" for admin_id in sorted(admin_list)])
+            await update.message.reply_text(f"📋 Список дополнительных администраторов:\n{admin_text}")
+        else:
+            await update.message.reply_text("📋 Список дополнительных администраторов пуст")
+
+    elif action == "add":
+        if len(context.args) < 2:
+            await update.message.reply_text("❌ Укажите user_id: /admin add <user_id>")
+            return
+
+        try:
+            new_admin_id = int(context.args[1])
+            if new_admin_id == ADMIN_ID:
+                await update.message.reply_text("❌ Вы уже являетесь главным администратором")
+                return
+
+            if new_admin_id in admin_list:
+                await update.message.reply_text("❌ Этот пользователь уже является администратором")
+                return
+
+            admin_list.add(new_admin_id)
+            await update.message.reply_text(f"✅ Пользователь {new_admin_id} добавлен в администраторы")
+
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат user_id")
+
+    elif action == "del":
+        if len(context.args) < 2:
+            await update.message.reply_text("❌ Укажите user_id: /admin del <user_id>")
+            return
+
+        try:
+            admin_to_remove = int(context.args[1])
+            if admin_to_remove == ADMIN_ID:
+                await update.message.reply_text("❌ Нельзя удалить главного администратора")
+                return
+
+            if admin_to_remove not in admin_list:
+                await update.message.reply_text("❌ Этот пользователь не является администратором")
+                return
+
+            admin_list.remove(admin_to_remove)
+            await update.message.reply_text(f"✅ Пользователь {admin_to_remove} удален из администраторов")
+
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат user_id")
+
+    else:
+        await update.message.reply_text(
+            "❌ Неизвестная команда\n\n"
+            "Доступные команды:\n"
+            "/admin add <user_id> - добавить админа\n"
+            "/admin del <user_id> - удалить админа\n"
+            "/admin list - показать список"
+        )
+
 async def auto_remove_sos(chat_id: int, topic_id: int, context: ContextTypes.DEFAULT_TYPE):
     """Автоматически снимает SOS через 5 минут"""
     try:
         await asyncio.sleep(300)  # 5 минут = 300 секунд
-        
+
         # Проверяем, активен ли ещё SOS
         if (chat_id in active_topics and 
             topic_id in active_topics[chat_id]):
-            
+
             logging.info(f"Автоматическое снятие SOS для темы {topic_id} в чате {chat_id}")
-            
+
             # Убираем тему из активных
             active_topics[chat_id].remove(topic_id)
             if not active_topics[chat_id]:
                 del active_topics[chat_id]
-            
+
             # Убираем время активации
             if (chat_id, topic_id) in sos_activation_times:
                 del sos_activation_times[(chat_id, topic_id)]
-            
+
             # Обновляем сообщение в активных темах
             await update_active_topics_message(chat_id, context)
-        
+
         # Убираем задачу из словаря
         if (chat_id, topic_id) in sos_removal_tasks:
             del sos_removal_tasks[(chat_id, topic_id)]
-            
+
     except asyncio.CancelledError:
         logging.info(f"Задача автоснятия SOS отменена для темы {topic_id}")
     except Exception as e:
@@ -907,11 +1137,11 @@ async def update_sos_times(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
             await asyncio.sleep(30)  # Обновляем каждые 30 секунд
             if chat_id in active_topics and active_topics[chat_id]:
                 await update_active_topics_message(chat_id, context)
-        
+
         # Убираем задачу из словаря когда нет активных тем
         if chat_id in sos_update_tasks:
             del sos_update_tasks[chat_id]
-            
+
     except asyncio.CancelledError:
         logging.info(f"Задача обновления времени SOS отменена для чата {chat_id}")
     except Exception as e:
@@ -983,7 +1213,7 @@ async def check_sos_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if chat_id in workers_dict and message_thread_id in workers_dict[chat_id]:
                 workers = workers_dict[chat_id][message_thread_id]
                 topic_name = topics_dict.get(chat_id, {}).get(message_thread_id, f"Тема {message_thread_id}")
-                
+
                 # Создаем ссылку на топик
                 try:
                     chat = await context.bot.get_chat(chat_id)
@@ -992,30 +1222,30 @@ async def check_sos_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         # Для приватных чатов используем другой формат
                         link = f"https://t.me/c/{str(chat_id)[4:]}/{message_thread_id}"
-                    
+
                     # Отправляем уведомления воркерам в личные сообщения
                     for worker in workers:
                         # Убираем @ из упоминания пользователя, если есть
                         username = worker.replace('@', '') if worker.startswith('@') else worker
-                        
+
                         try:
                             notification_text = (
                                 f"🚨 ВНИМАНИЕ! Нужен номер в теме '{topic_name}'\n"
                                 f"Ссылка: {link}"
                             )
-                            
+
                             # Пытаемся найти пользователя по username и отправить ЛС
                             try:
                                 # Получаем информацию о участниках чата для поиска user_id по username
                                 chat_members = await context.bot.get_chat_administrators(chat_id)
                                 user_id = None
-                                
+
                                 # Ищем user_id по username среди администраторов
                                 for member in chat_members:
                                     if member.user.username and member.user.username.lower() == username.lower():
                                         user_id = member.user.id
                                         break
-                                
+
                                 # Если не нашли среди админов, пробуем среди обычных участников
                                 # (это ограниченная функция, работает не во всех группах)
                                 if not user_id:
@@ -1026,7 +1256,7 @@ async def check_sos_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                             user_id = chat_member.user.id
                                     except:
                                         pass
-                                
+
                                 if user_id:
                                     # Пытаемся отправить ЛС
                                     await context.bot.send_message(
@@ -1044,7 +1274,7 @@ async def check_sos_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                         disable_web_page_preview=True
                                     )
                                     logging.info(f"Не удалось найти user_id для {worker}, отправлено в группу")
-                                    
+
                             except Exception as dm_error:
                                 # Если не удалось отправить ЛС (пользователь не начинал диалог с ботом)
                                 logging.warning(f"Не удалось отправить ЛС воркеру {worker}: {str(dm_error)}")
@@ -1056,12 +1286,12 @@ async def check_sos_word(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     disable_web_page_preview=True
                                 )
                                 logging.info(f"Отправлено в группу как fallback для {worker}")
-                            
+
                         except Exception as e:
                             logging.error(f"Общая ошибка при отправке уведомления воркеру {worker}: {str(e)}")
-                    
+
                     logging.info(f"Отправлены уведомления воркерам для темы {message_thread_id}")
-                    
+
                 except Exception as e:
                     logging.error(f"Ошибка при отправке уведомлений воркерам: {str(e)}")
 
@@ -1807,10 +2037,12 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("worker", worker_command))
     application.add_handler(CommandHandler("only", only_command))
+    application.add_handler(CommandHandler("new", new_command))
     application.add_handler(CommandHandler("gadd", add_sos_word))
     application.add_handler(CommandHandler("gdel", delete_sos_word))
     application.add_handler(CommandHandler("gall", list_sos_words))
-    
+    application.add_handler(CommandHandler("admin", admin_command))
+
     application.add_handler(CommandHandler("game", game_command))
     application.add_handler(CommandHandler("stopgame", stopgame_command))
     application.add_handler(conv_handler)
