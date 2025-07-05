@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 import random
+import sqlite3
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters, ConversationHandler
 from telegram.error import RetryAfter
@@ -31,8 +32,9 @@ WAITING_FOR_TOPIC_ID = 2
 WAITING_FOR_BROADCAST = 3
 WAITING_FOR_RENAME_COUNT = 4
 WAITING_FOR_RENAME = 5
-PLAYING_GUESS_NUMBER = 6
-PLAYING_DICE = 7
+WAITING_FOR_PC_SELECTION = 6
+PLAYING_GUESS_NUMBER = 7
+PLAYING_DICE = 8
 
 # Словарь для хранения тем
 topics_dict = {}
@@ -61,6 +63,64 @@ battleship_games = {}
 restricted_topics = {}
 # Список дополнительных админов (кроме главного ADMIN_ID)
 admin_list = set()
+
+# Инициализация базы данных для ПК
+def init_pc_database():
+    conn = sqlite3.connect('pc_database.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS pc_list (
+            id INTEGER PRIMARY KEY,
+            is_available BOOLEAN DEFAULT TRUE
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def get_available_pcs():
+    """Получить список доступных ПК"""
+    conn = sqlite3.connect('pc_database.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT id FROM pc_list WHERE is_available = TRUE ORDER BY id')
+    result = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return result
+
+def take_pc(pc_id):
+    """Занять ПК"""
+    conn = sqlite3.connect('pc_database.db')
+    cursor = conn.cursor()
+    cursor.execute('UPDATE pc_list SET is_available = FALSE WHERE id = ?', (pc_id,))
+    conn.commit()
+    conn.close()
+
+def release_pc(pc_id):
+    """Освободить ПК"""
+    conn = sqlite3.connect('pc_database.db')
+    cursor = conn.cursor()
+    cursor.execute('UPDATE pc_list SET is_available = TRUE WHERE id = ?', (pc_id,))
+    conn.commit()
+    conn.close()
+
+def add_pcs(count):
+    """Добавить ПК в базу"""
+    conn = sqlite3.connect('pc_database.db')
+    cursor = conn.cursor()
+    for i in range(1, count + 1):
+        cursor.execute('INSERT OR IGNORE INTO pc_list (id, is_available) VALUES (?, TRUE)', (i,))
+    conn.commit()
+    conn.close()
+
+def clear_all_pcs():
+    """Очистить все ПК"""
+    conn = sqlite3.connect('pc_database.db')
+    cursor = conn.cursor()
+    cursor.execute('DELETE FROM pc_list')
+    conn.commit()
+    conn.close()
+
+# Инициализируем базу данных при запуске
+init_pc_database()
 
 async def create_active_topics_thread(chat_id: int, context: ContextTypes.DEFAULT_TYPE):
     """Создает топик 'Активные темы' если его нет"""
@@ -243,7 +303,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
         context.user_data['request_name_message_id'] = message.message_id
-        
+
         # Отправляем дополнительное сообщение
         await context.bot.send_message(
             chat_id=query.message.chat_id,
@@ -253,6 +313,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         return WAITING_FOR_RENAME
+    elif query.data.startswith('select_pc_'):
+        await handle_pc_selection(update, context)
+        return ConversationHandler.END
 
 async def check_forum_support(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
@@ -454,8 +517,8 @@ async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  "ℹ️ Не забудьте нажать на галочку под сообщением",
             reply_markup=reply_markup
         )
-        
-        
+
+
 
         await update.message.reply_text(f"✅ Тема сброшена в режим переименования: {new_name}")
 
@@ -864,80 +927,54 @@ async def rename_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ошибка: не найдены данные о теме")
         return ConversationHandler.END
 
-    chat_id = topic_data['chat_id']
-    topic_id = topic_data['topic_id']
-    old_name = topic_data['old_name']
-    number = old_name.split(":")[0]
+    # Сохраняем название темы для следующего этапа
+    context.user_data['topic_name'] = new_name
 
+    # Переходим к выбору ПК
+    available_pcs = get_available_pcs()
+    
+    if not available_pcs:
+        await update.message.reply_text("❌ Нет доступных ПК. Обратитесь к администратору.")
+        return ConversationHandler.END
+
+    # Создаем клавиатуру с доступными ПК
+    keyboard = []
+    row = []
+    for pc_id in available_pcs:
+        row.append(InlineKeyboardButton(f"ПК {pc_id}", callback_data=f'select_pc_{pc_id}'))
+        if len(row) == 5:  # По 5 кнопок в ряду
+            keyboard.append(row)
+            row = []
+    if row:  # Добавляем оставшиеся кнопки
+        keyboard.append(row)
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    # Удаляем предыдущие сообщения
     try:
-        await context.bot.edit_forum_topic(
-            chat_id=chat_id,
-            message_thread_id=topic_id,
-            name=f"{number}:{new_name}"
-        )
-
-        topics_dict[chat_id][topic_id] = f"{number}:{new_name}"
-        if chat_id in rename_topics_dict:
-            rename_topics_dict[chat_id].discard(topic_id)
-
-        await update.message.reply_text(f"Тема успешно переименована в {number}:{new_name}")
-        
-        # Отправляем уведомление в топик
-        chat = await context.bot.get_chat(chat_id)
-        if chat.username:
-            topic_link = f"https://t.me/{chat.username}/{topic_id}"
-        else:
-            topic_link = f"https://t.me/c/{str(chat_id)[4:]}/{topic_id}"
-            
-        topic_info_message = (
-            f"Темы 🆔: {topic_id}\n"
-            f"Наименование: {number}:{new_name}\n"
-            f"Ссылка 🔗 на тему: {topic_link}"
-        )
-        
-        # Отправляем в топик
-        await context.bot.send_message(
-            chat_id=chat_id,
-            message_thread_id=topic_id,
-            text=topic_info_message,
-            disable_web_page_preview=True
-        )
-        
-        # Отправляем главному админу в ЛС (если ADMIN_ID настроен)
-        if ADMIN_ID != 0:
-            try:
-                await context.bot.send_message(
-                    chat_id=ADMIN_ID,
-                    text=f"Новая тема переименована:\n\n{topic_info_message}",
-                    disable_web_page_preview=True
-                )
-            except Exception as e:
-                logging.error(f"Не удалось отправить уведомление админу: {str(e)}")
-
-        # Удаляем сообщения бота
-        try:
-            # Удаляем сообщение с кнопкой подтверждения
-            if 'confirmation_message_id' in context.user_data:
-                await context.bot.delete_message(
-                    chat_id=chat_id,
-                    message_id=context.user_data['confirmation_message_id']
-                )
-            # Удаляем сообщение с запросом имени
-            if 'request_name_message_id' in context.user_data:
-                await context.bot.delete_message(
-                    chat_id=chat_id,
-                    message_id=context.user_data['request_name_message_id']
-                )
-        except Exception as e:
-            print(f"Ошибка при удалении сообщений: {str(e)}")
-
+        if 'confirmation_message_id' in context.user_data:
+            await context.bot.delete_message(
+                chat_id=topic_data['chat_id'],
+                message_id=context.user_data['confirmation_message_id']
+            )
+        if 'request_name_message_id' in context.user_data:
+            await context.bot.delete_message(
+                chat_id=topic_data['chat_id'],
+                message_id=context.user_data['request_name_message_id']
+            )
     except Exception as e:
-        await update.message.reply_text(f"Ошибка при переименовании темы: {str(e)}")
+        logging.error(f"Ошибка при удалении предыдущих сообщений: {str(e)}")
 
-    context.user_data.pop('current_rename_topic', None)
-    context.user_data.pop('confirmation_message_id', None)
-    context.user_data.pop('request_name_message_id', None)
-    return ConversationHandler.END
+    # Отправляем сообщение с выбором ПК
+    pc_selection_message = await update.message.reply_text(
+        "Выберите ПК по нумерации:\n(наклейка в уголку монитора, или сверху в уголку системного блока)",
+        reply_markup=reply_markup
+    )
+
+    # Сохраняем ID сообщения для последующего удаления
+    context.user_data['pc_selection_message_id'] = pc_selection_message.message_id
+
+    return WAITING_FOR_PC_SELECTION
 
 async def is_admin(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
@@ -1000,6 +1037,55 @@ async def list_sos_words(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     words_list = "\n".join(sorted(sos_words))
     await update.message.reply_text(f"Список SOS-слов:\n{words_list}")
+
+async def pc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Управление списком ПК (только для админов)"""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+
+    # Проверяем права администратора
+    if not await is_admin(chat_id, user_id, context):
+        await update.message.reply_text("❌ Эта команда доступна только администраторам")
+        return
+
+    if not context.args:
+        # Показываем текущее состояние ПК
+        available_pcs = get_available_pcs()
+        if available_pcs:
+            pcs_text = ", ".join(map(str, available_pcs))
+            await update.message.reply_text(
+                f"📋 Доступные ПК: {pcs_text}\n\n"
+                "Использование:\n"
+                "/pc <количество> - добавить ПК (например: /pc 20)\n"
+                "/pc clear - очистить весь список ПК"
+            )
+        else:
+            await update.message.reply_text(
+                "📋 Список ПК пуст\n\n"
+                "Использование:\n"
+                "/pc <количество> - добавить ПК (например: /pc 20)\n"
+                "/pc clear - очистить весь список ПК"
+            )
+        return
+
+    arg = context.args[0].lower()
+
+    if arg == "clear":
+        clear_all_pcs()
+        await update.message.reply_text("✅ Весь список ПК очищен")
+    else:
+        try:
+            count = int(arg)
+            if count <= 0:
+                await update.message.reply_text("❌ Количество ПК должно быть положительным числом")
+                return
+            
+            add_pcs(count)
+            available_pcs = get_available_pcs()
+            pcs_text = ", ".join(map(str, available_pcs))
+            await update.message.reply_text(f"✅ Добавлено ПК до номера {count}\nДоступные ПК: {pcs_text}")
+        except ValueError:
+            await update.message.reply_text("❌ Неверный формат. Используйте: /pc <число> или /pc clear")
 
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Управление списком дополнительных администраторов"""
@@ -1993,6 +2079,110 @@ async def handle_battleship_move(update: Update, context: ContextTypes.DEFAULT_T
                         reply_markup=get_battleship_keyboard(user_id, show_player_field=False)
                     )
 
+async def handle_pc_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработка выбора ПК"""
+    query = update.callback_query
+    await query.answer()
+
+    pc_id = int(query.data.split('_')[2])
+    topic_data = context.user_data.get('current_rename_topic')
+    topic_name = context.user_data.get('topic_name')
+
+    if not topic_data or not topic_name:
+        await query.edit_message_text("Ошибка: не найдены данные о теме")
+        return
+
+    chat_id = topic_data['chat_id']
+    topic_id = topic_data['topic_id']
+    old_name = topic_data['old_name']
+    number = old_name.split(":")[0]
+
+    # Проверяем, что ПК ещё доступен
+    available_pcs = get_available_pcs()
+    if pc_id not in available_pcs:
+        await query.edit_message_text("❌ Этот ПК уже занят. Выберите другой.")
+        return
+
+    # Занимаем ПК
+    take_pc(pc_id)
+
+    # Формируем новое название темы с номером ПК
+    final_topic_name = f"{number}:{topic_name} (#ПК{pc_id})"
+
+    try:
+        # Переименовываем тему
+        await context.bot.edit_forum_topic(
+            chat_id=chat_id,
+            message_thread_id=topic_id,
+            name=final_topic_name
+        )
+
+        # Обновляем словарь тем
+        topics_dict[chat_id][topic_id] = final_topic_name
+        if chat_id in rename_topics_dict:
+            rename_topics_dict[chat_id].discard(topic_id)
+
+        # Удаляем сообщение с выбором ПК
+        try:
+            await context.bot.delete_message(
+                chat_id=chat_id,
+                message_id=context.user_data.get('pc_selection_message_id')
+            )
+        except Exception as e:
+            logging.error(f"Ошибка при удалении сообщения выбора ПК: {str(e)}")
+
+        # Отправляем подтверждение
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=topic_id,
+            text=f"✅ Тема успешно переименована: {final_topic_name}\n🖥️ ПК {pc_id} закреплён за вами"
+        )
+
+        # Отправляем уведомление в топик
+        chat = await context.bot.get_chat(chat_id)
+        if chat.username:
+            topic_link = f"https://t.me/{chat.username}/{topic_id}"
+        else:
+            topic_link = f"https://t.me/c/{str(chat_id)[4:]}/{topic_id}"
+
+        topic_info_message = (
+            f"Темы 🆔: {topic_id}\n"
+            f"Наименование: {final_topic_name}\n"
+            f"ПК: {pc_id}\n"
+            f"Ссылка 🔗 на тему: {topic_link}"
+        )
+
+        # Отправляем в топик
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=topic_id,
+            text=topic_info_message,
+            disable_web_page_preview=True
+        )
+
+        # Отправляем главному админу в ЛС (если ADMIN_ID настроен)
+        if ADMIN_ID != 0:
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=f"Новая тема переименована:\n\n{topic_info_message}",
+                    disable_web_page_preview=True
+                )
+            except Exception as e:
+                logging.error(f"Не удалось отправить уведомление админу: {str(e)}")
+
+    except Exception as e:
+        # Если что-то пошло не так, освобождаем ПК
+        release_pc(pc_id)
+        await query.edit_message_text(f"Ошибка при переименовании темы: {str(e)}")
+
+    # Очищаем временные данные
+    context.user_data.pop('current_rename_topic', None)
+    context.user_data.pop('confirmation_message_id', None)
+    context.user_data.pop('request_name_message_id', None)
+    context.user_data.pop('pc_selection_message_id', None)
+    context.user_data.pop('topic_name', None)
+
 def get_bot_battleship_move(player_field):
     """Получить ход бота для морского боя"""
     # Простая стратегия: случайный выбор незатронутых клеток
@@ -2029,6 +2219,7 @@ def main():
             WAITING_FOR_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, send_broadcast)],
             WAITING_FOR_RENAME_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_rename_topics)],
             WAITING_FOR_RENAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, rename_topic)],
+            WAITING_FOR_PC_SELECTION: [CallbackQueryHandler(button_handler, pattern='^select_pc_')],
             PLAYING_GUESS_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_guess_number)]
         },
         fallbacks=[]
@@ -2038,6 +2229,7 @@ def main():
     application.add_handler(CommandHandler("worker", worker_command))
     application.add_handler(CommandHandler("only", only_command))
     application.add_handler(CommandHandler("new", new_command))
+    application.add_handler(CommandHandler("pc", pc_command))
     application.add_handler(CommandHandler("gadd", add_sos_word))
     application.add_handler(CommandHandler("gdel", delete_sos_word))
     application.add_handler(CommandHandler("gall", list_sos_words))
