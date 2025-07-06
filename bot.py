@@ -316,6 +316,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif query.data.startswith('select_pc_'):
         await handle_pc_selection(update, context)
         return ConversationHandler.END
+    elif query.data.startswith('occupied_pc_'):
+        pc_id = query.data.split('_')[2]
+        await query.answer(f"ПК {pc_id} уже занят", show_alert=True)
+        return WAITING_FOR_PC_SELECTION
 
 async def check_forum_support(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
@@ -932,16 +936,30 @@ async def rename_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Переходим к выбору ПК
     available_pcs = get_available_pcs()
-    
+
     if not available_pcs:
         await update.message.reply_text("❌ Нет доступных ПК. Обратитесь к администратору.")
         return ConversationHandler.END
 
-    # Создаем клавиатуру с доступными ПК
+    # Получаем все ПК из базы данных
+    conn = sqlite3.connect('pc_database.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT id, is_available FROM pc_list ORDER BY id')
+    all_pcs = cursor.fetchall()
+    conn.close()
+
+    # Создаем клавиатуру со всеми ПК
     keyboard = []
     row = []
-    for pc_id in available_pcs:
-        row.append(InlineKeyboardButton(f"ПК {pc_id}", callback_data=f'select_pc_{pc_id}'))
+    for pc_id, is_available in all_pcs:
+        if is_available:
+            button_text = str(pc_id)
+            callback_data = f'select_pc_{pc_id}'
+        else:
+            button_text = f"{pc_id}❌"
+            callback_data = f'occupied_pc_{pc_id}'  # Для занятых ПК
+        
+        row.append(InlineKeyboardButton(button_text, callback_data=callback_data))
         if len(row) == 5:  # По 5 кнопок в ряду
             keyboard.append(row)
             row = []
@@ -1079,7 +1097,7 @@ async def pc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if count <= 0:
                 await update.message.reply_text("❌ Количество ПК должно быть положительным числом")
                 return
-            
+
             add_pcs(count)
             available_pcs = get_available_pcs()
             pcs_text = ", ".join(map(str, available_pcs))
@@ -2098,9 +2116,14 @@ async def handle_pc_selection(update: Update, context: ContextTypes.DEFAULT_TYPE
     number = old_name.split(":")[0]
 
     # Проверяем, что ПК ещё доступен
-    available_pcs = get_available_pcs()
-    if pc_id not in available_pcs:
-        await query.edit_message_text("❌ Этот ПК уже занят. Выберите другой.")
+    conn = sqlite3.connect('pc_database.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT is_available FROM pc_list WHERE id = ?', (pc_id,))
+    result = cursor.fetchone()
+    conn.close()
+    
+    if not result or not result[0]:
+        await query.answer("❌ Этот ПК уже занят. Выберите другой.", show_alert=True)
         return
 
     # Занимаем ПК
