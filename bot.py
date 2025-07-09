@@ -3,13 +3,15 @@ import logging
 import asyncio
 import random
 import sqlite3
+from datetime import datetime, time
+import pytz
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters, ConversationHandler
 from telegram.error import RetryAfter
 from dotenv import load_dotenv
 
 load_dotenv()
-TOKEN = os.getenv('TOKEN')
+TOKEN = os.getenv('TELEGRAM_TOKEN')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
 GAMES_ENABLED = os.getenv('GAMES_ENABLED', 'true').lower() == 'true'
 
@@ -35,6 +37,11 @@ WAITING_FOR_RENAME = 5
 WAITING_FOR_PC_SELECTION = 6
 PLAYING_GUESS_NUMBER = 7
 PLAYING_DICE = 8
+WAITING_FOR_BREAK_NAME = 9
+WAITING_FOR_BREAK_START_TIME = 10
+WAITING_FOR_BREAK_START_TEXT = 11
+WAITING_FOR_BREAK_END_TIME = 12
+WAITING_FOR_BREAK_END_TEXT = 13
 
 # Словарь для хранения тем
 topics_dict = {}
@@ -63,6 +70,14 @@ battleship_games = {}
 restricted_topics = {}
 # Список дополнительных админов (кроме главного ADMIN_ID)
 admin_list = set()
+# Словарь для хранения перерывов {break_id: {name, start_time, start_text, end_time, end_text}}
+breaks_dict = {}
+# Счетчик для ID перерывов
+break_id_counter = 1
+# Словарь для хранения задач планировщика перерывов
+break_tasks = {}
+# Киевский часовой пояс
+KYIV_TZ = pytz.timezone('Europe/Kiev')
 
 # Инициализация базы данных для ПК
 def init_pc_database():
@@ -225,6 +240,12 @@ async def update_active_topics_message(chat_id: int, context: ContextTypes.DEFAU
         logging.error(f"Ошибка при обновлении сообщения 'Активные темы': {str(e)}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    chat_id = update.message.chat_id
+
+    # Проверяем, является ли пользователь администратором
+    is_user_admin = await is_admin(chat_id, user_id, context)
+
     keyboard = [
         [InlineKeyboardButton("Список тем", callback_data='list_topics')],
         [InlineKeyboardButton("Создать тему", callback_data='create_topic')],
@@ -233,6 +254,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("Создать рассылку", callback_data='create_broadcast')],
         [InlineKeyboardButton("🖌 Создать темы с переименованием", callback_data='create_rename_topics')]
     ]
+
+    # Добавляем кнопку "Перерыв" только для админов
+    if is_user_admin:
+        keyboard.append([InlineKeyboardButton("☕ Перерыв", callback_data='break_menu')])
     reply_markup = InlineKeyboardMarkup(keyboard)
     greeting_message = await update.message.reply_text("👋")
 
@@ -279,6 +304,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await request_broadcast_message(update, context)
     elif query.data == 'create_rename_topics':
         await request_rename_topics_count(update, context)
+    elif query.data == 'break_menu':
+        await show_break_menu(update, context)
+    elif query.data == 'create_break':
+        await request_break_name(update, context)
+    elif query.data == 'list_breaks':
+        await list_breaks(update, context)
+    elif query.data.startswith('delete_break_'):
+        break_id = int(query.data.split('_')[2])
+        await delete_break(update, context, break_id)
     elif query.data.startswith('confirm_rename_'):
         topic_id = int(query.data.split('_')[2])
         chat = await context.bot.get_chat(query.message.chat_id)
@@ -320,6 +354,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pc_id = query.data.split('_')[2]
         await query.answer(f"ПК {pc_id} уже занят", show_alert=True)
         return WAITING_FOR_PC_SELECTION
+    elif query.data == 'back_to_start':
+        # Возвращаемся к стартовому меню
+        await start_menu_after_back(update, context)
 
 async def check_forum_support(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
@@ -726,7 +763,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if (not update.message.from_user.is_bot and 
             update.message.reply_to_message):
             # Проверяем, является ли это ответом на сообщение с запросом имени
-            reply_text = update.message.reply_to_message.text
+            reply_text = update.message.reply_to_message.text```python
             if (update.message.reply_to_message.from_user.is_bot and
                 reply_text and "Введите имя ответом на сообщение" in reply_text):
                 is_reply_to_name_request = True
@@ -958,7 +995,7 @@ async def rename_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             button_text = f"{pc_id}❌"
             callback_data = f'occupied_pc_{pc_id}'  # Для занятых ПК
-        
+
         row.append(InlineKeyboardButton(button_text, callback_data=callback_data))
         if len(row) == 5:  # По 5 кнопок в ряду
             keyboard.append(row)
@@ -1105,6 +1142,338 @@ async def pc_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("❌ Неверный формат. Используйте: /pc <число> или /pc clear")
 
+async def show_break_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать меню управления перерывами"""
+    query = update.callback_query
+
+    breaks_count = len(breaks_dict)
+
+    keyboard = []
+
+    if breaks_count < 5:
+        keyboard.append([InlineKeyboardButton("➕ Создать перерыв", callback_data='create_break')])
+
+    if breaks_count > 0:
+        keyboard.append([InlineKeyboardButton("📋 Список перерывов", callback_data='list_breaks')])
+
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data='back_to_start')])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(
+        f"☕ Управление перерывами\n\n"
+        f"Активных перерывов: {breaks_count}/5\n\n"
+        f"Здесь вы можете создавать автоматические напоминания о перерывах, "
+        f"которые будут отправляться во все топики в указанное время.",
+        reply_markup=reply_markup
+    )
+
+async def request_break_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Запросить название перерыва"""
+    query = update.callback_query
+
+    await query.edit_message_text(
+        "☕ Создание нового перерыва\n\n"
+        "Шаг 1/5: Введите название перерыва\n"
+        "Пример: Кофе Брейк"
+    )
+
+    return WAITING_FOR_BREAK_NAME
+
+async def process_break_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработать название перерыва"""
+    break_name = update.message.text.strip()
+
+    if len(break_name) > 50:
+        await update.message.reply_text(
+            "❌ Название слишком длинное. Максимум 50 символов.\n"
+            "Введите название перерыва:"
+        )
+        return WAITING_FOR_BREAK_NAME
+
+    context.user_data['break_data'] = {'name': break_name}
+
+    await update.message.reply_text(
+        f"✅ Название сохранено: {break_name}\n\n"
+        "Шаг 2/5: Введите время начала перерыва (по Киеву)\n"
+        "Формат: ЧЧ:ММ\n"
+        "Пример: 10:00"
+    )
+
+    return WAITING_FOR_BREAK_START_TIME
+
+async def process_break_start_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработать время начала перерыва"""
+    time_text = update.message.text.strip()
+
+    try:
+        # Проверяем формат времени
+        time_obj = datetime.strptime(time_text, "%H:%M").time()
+
+        context.user_data['break_data']['start_time'] = time_text
+
+        await update.message.reply_text(
+            f"✅ Время начала сохранено: {time_text}\n\n"
+            "Шаг 3/5: Введите текст сообщения о начале перерыва\n"
+            "Пример: Все уходим на кофе брейк!"
+        )
+
+        return WAITING_FOR_BREAK_START_TEXT
+
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Неверный формат времени. Используйте формат ЧЧ:ММ\n"
+            "Пример: 10:00\n"
+            "Введите время начала перерыва:"
+        )
+        return WAITING_FOR_BREAK_START_TIME
+
+async def process_break_start_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработать текст начала перерыва"""
+    start_text = update.message.text.strip()
+
+    if len(start_text) > 200:
+        await update.message.reply_text(
+            "❌ Текст слишком длинный. Максимум 200 символов.\n"
+            "Введите текст начала перерыва:"
+        )
+        return WAITING_FOR_BREAK_START_TEXT
+
+    context.user_data['break_data']['start_text'] = start_text
+
+    await update.message.reply_text(
+        f"✅ Текст начала сохранен\n\n"
+        "Шаг 4/5: Введите время окончания перерыва (по Киеву)\n"
+        "Формат: ЧЧ:ММ\n"
+        "Пример: 11:00"
+    )
+
+    return WAITING_FOR_BREAK_END_TIME
+
+async def process_break_end_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработать время окончания перерыва"""
+    time_text = update.message.text.strip()
+
+    try:
+        # Проверяем формат времени
+        end_time_obj = datetime.strptime(time_text, "%H:%M").time()
+        start_time_obj = datetime.strptime(context.user_data['break_data']['start_time'], "%H:%M").time()
+
+        # Проверяем, что время окончания позже времени начала
+        if end_time_obj <= start_time_obj:
+            await update.message.reply_text(
+                "❌ Время окончания должно быть позже времени начала.\n"
+                "Введите время окончания перерыва:"
+            )
+            return WAITING_FOR_BREAK_END_TIME
+
+        context.user_data['break_data']['end_time'] = time_text
+
+        await update.message.reply_text(
+            f"✅ Время окончания сохранено: {time_text}\n\n"
+            "Шаг 5/5: Введите текст сообщения об окончании перерыва\n"
+            "Пример: Обратно за работу!"
+        )
+
+        return WAITING_FOR_BREAK_END_TEXT
+
+async def process_break_end_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработать текст окончания перерыва и создать перерыв"""
+    global break_id_counter
+
+    end_text = update.message.text.strip()
+
+    if len(end_text) > 200:
+        await update.message.reply_text(
+            "❌ Текст слишком длинный. Максимум 200 символов.\n"
+            "Введите текст окончания перерыва:"
+        )
+        return WAITING_FOR_BREAK_END_TEXT
+
+    # Сохраняем перерыв
+    break_data = context.user_data['break_data']
+    break_data['end_text'] = end_text
+
+    break_id = break_id_counter
+    breaks_dict[break_id] = break_data
+    break_id_counter += 1
+
+    # Планируем задачи для перерыва
+    await schedule_break_tasks(break_id, break_data, context)
+
+    # Очищаем временные данные
+    context.user_data.pop('break_data', None)
+
+    await update.message.reply_text(
+        f"✅ Перерыв '{break_data['name']}' успешно создан!\n\n"
+        f"📋 Детали:\n"
+        f"Название: {break_data['name']}\n"
+        f"Начало: {break_data['start_time']} - {break_data['start_text']}\n"
+        f"Окончание: {break_data['end_time']} - {break_data['end_text']}\n\n"
+        f"Уведомления будут отправляться во все активные топики автоматически."
+    )
+
+    return ConversationHandler.END
+
+async def list_breaks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать список перерывов"""
+    query = update.callback_query
+
+    if not breaks_dict:
+        await query.edit_message_text(
+            "📋 Список перерывов пуст\n\n"
+            "Создайте первый перерыв, чтобы он появился здесь.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⬅️ Назад", callback_data='break_menu')
+            ]])
+        )
+        return
+
+    text = "📋 Активные перерывы:\n\n"
+    keyboard = []
+
+    for break_id, break_data in breaks_dict.items():
+        text += (
+            f"🔸 {break_data['name']}\n"
+            f"   Начало: {break_data['start_time']}\n"
+            f"   Окончание: {break_data['end_time']}\n\n"
+        )
+        keyboard.append([InlineKeyboardButton(
+            f"🗑 Удалить '{break_data['name']}'", 
+            callback_data=f'delete_break_{break_id}'
+        )])
+
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data='break_menu')])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(text, reply_markup=reply_markup)
+
+async def delete_break(update: Update, context: ContextTypes.DEFAULT_TYPE, break_id: int):
+    """Удалить перерыв"""
+    query = update.callback_query
+
+    if break_id not in breaks_dict:
+        await query.answer("Перерыв не найден!", show_alert=True)
+        return
+
+    break_name = breaks_dict[break_id]['name']
+
+    # Отменяем задачи для этого перерыва
+    if break_id in break_tasks:
+        for task in break_tasks[break_id]:
+            if not task.done():
+                task.cancel()
+        del break_tasks[break_id]
+
+    # Удаляем перерыв
+    del breaks_dict[break_id]
+
+    await query.answer(f"Перерыв '{break_name}' удален!", show_alert=True)
+
+    # Обновляем список перерывов
+    await list_breaks(update, context)
+
+async def schedule_break_tasks(break_id: int, break_data: dict, context: ContextTypes.DEFAULT_TYPE):
+    """Планировать задачи для перерыва"""
+    if break_id not in break_tasks:
+        break_tasks[break_id] = []
+
+    # Создаем задачи для начала и окончания перерыва
+    start_task = asyncio.create_task(
+        schedule_break_notification(break_data['start_time'], break_data['start_text'], context)
+    )
+    end_task = asyncio.create_task(
+        schedule_break_notification(break_data['end_time'], break_data['end_text'], context)
+    )
+
+    break_tasks[break_id] = [start_task, end_task]
+
+async def schedule_break_notification(time_str: str, message_text: str, context: ContextTypes.DEFAULT_TYPE):
+    """Планировать уведомление о перерыве"""
+    try:
+        while True:
+            # Получаем текущее время в Киеве
+            now = datetime.now(KYIV_TZ)
+            target_time = datetime.strptime(time_str, "%H:%M").time()
+
+            # Создаем datetime для сегодняшнего целевого времени
+            today_target = datetime.combine(now.date(), target_time)
+            today_target = KYIV_TZ.localize(today_target)
+
+            # Если время уже прошло сегодня, планируем на завтра
+            if today_target <= now:
+                tomorrow = now.date().replace(day=now.day + 1) if now.day < 28 else now.date().replace(month=now.month + 1, day=1)
+                today_target = datetime.combine(tomorrow, target_time)
+                today_target = KYIV_TZ.localize(today_target)
+
+            # Вычисляем время ожидания
+            wait_seconds = (today_target - now).total_seconds()
+
+            # Ждем до целевого времени
+            await asyncio.sleep(wait_seconds)
+
+            # Отправляем уведомления во все топики
+            await send_break_notification_to_all_topics(message_text, context)
+
+            # Ждем до следующего дня (24 часа - небольшой буфер)
+            await asyncio.sleep(24 * 60 * 60 - 60)
+
+    except asyncio.CancelledError:
+        logging.info(f"Задача уведомления о перерыве в {time_str} отменена")
+    except Exception as e:
+        logging.error(f"Ошибка в планировщике перерыва: {str(e)}")
+
+async def start_menu_after_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать стартовое меню после возврата"""
+    query = update.callback_query
+    user_id = update.effective_user.id
+    chat_id = query.message.chat_id
+
+    # Проверяем, является ли пользователь администратором
+    is_user_admin = await is_admin(chat_id, user_id, context)
+
+    keyboard = [
+        [InlineKeyboardButton("Список тем", callback_data='list_topics')],
+        [InlineKeyboardButton("Создать тему", callback_data='create_topic')],
+        [InlineKeyboardButton("Удалить тему", callback_data='delete_topic')],
+        [InlineKeyboardButton("Удалить все темы", callback_data='delete_all_topics')],
+        [InlineKeyboardButton("Создать рассылку", callback_data='create_broadcast')],
+        [InlineKeyboardButton("🖌 Создать темы с переименованием", callback_data='create_rename_topics')]
+    ]
+
+    # Добавляем кнопку "Перерыв" только для админов
+    if is_user_admin:
+        keyboard.append([InlineKeyboardButton("☕ Перерыв", callback_data='break_menu')])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await query.edit_message_text(
+        'Привет! Я бот для управления темами в группах. Выберите действие:',
+        reply_markup=reply_markup
+    )
+
+async def send_break_notification_to_all_topics(message_text: str, context: ContextTypes.DEFAULT_TYPE):
+    """Отправить уведомление о перерыве во все топики"""
+    try:
+        for chat_id, topics in topics_dict.items():
+            for topic_id in topics.keys():
+                try:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        message_thread_id=topic_id,
+                        text=f"☕ {message_text}"
+                    )
+                    # Небольшая задержка между отправками
+                    await asyncio.sleep(0.1)
+                except Exception as e:
+                    logging.error(f"Ошибка при отправке уведомления о перерыве в топик {topic_id}: {str(e)}")
+
+        logging.info(f"Уведомление о перерыве отправлено во все топики: {message_text}")
+
+    except Exception as e:
+        logging.error(f"Ошибка при отправке уведомлений о перерыве: {str(e)}")
+
 async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Управление списком дополнительных администраторов"""
     user_id = update.effective_user.id
@@ -1127,18 +1496,18 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             admin_text = "\n".join([f"• {admin_id}" for admin_id in sorted(admin_list)])
             await update.message.reply_text(
                 f"📋 Список дополнительных администраторов:\n{admin_text}\n\n"
-                "Использование:\n"
-                "/admin add <user_id> - добавить админа\n"
-                "/admin del <user_id> - удалить админа\n"
-                "/admin list - показать список"
+                f"Использование:\n"
+                f"/admin add <user_id/@username> - добавить админа\n"
+                f"/admin del <user_id> - удалить админа\n"
+                f"/admin list - показать список"
             )
         else:
             await update.message.reply_text(
                 "📋 Список дополнительных администраторов пуст\n\n"
-                "Использование:\n"
-                "/admin add <user_id> - добавить админа\n"
-                "/admin del <user_id> - удалить админа\n"
-                "/admin list - показать список"
+                f"Использование:\n"
+                f"/admin add <user_id/@username> - добавить админа\n"
+                f"/admin del <user_id> - удалить админа\n"
+                f"/admin list - показать список"
             )
         return
 
@@ -1154,9 +1523,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "add":
         if len(context.args) < 2:
             await update.message.reply_text("❌ Укажите user_id: /admin add <user_id>")
-            return
-
-        try:
+            return        try:
             new_admin_id = int(context.args[1])
             if new_admin_id == ADMIN_ID:
                 await update.message.reply_text("❌ Вы уже являетесь главным администратором")
@@ -1170,7 +1537,26 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"✅ Пользователь {new_admin_id} добавлен в администраторы")
 
         except ValueError:
-            await update.message.reply_text("❌ Неверный формат user_id")
+            # Попытка добавить по username
+            username = context.args[1]
+            try:
+                # Получаем информацию о пользователе по username (работает только если пользователь есть в чате)
+                chat_member = await context.bot.get_chat_member(chat_id=update.effective_chat.id, user_id=username)
+                new_admin_id = chat_member.user.id
+
+                if new_admin_id == ADMIN_ID:
+                    await update.message.reply_text("❌ Вы уже являетесь главным администратором")
+                    return
+
+                if new_admin_id in admin_list:
+                    await update.message.reply_text("❌ Этот пользователь уже является администратором")
+                    return
+
+                admin_list.add(new_admin_id)
+                await update.message.reply_text(f"✅ Пользователь {username} (ID: {new_admin_id}) добавлен в администраторы")
+
+            except Exception as e:
+                await update.message.reply_text("❌ Неверный формат user_id или username")
 
     elif action == "del":
         if len(context.args) < 2:
@@ -1197,7 +1583,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ Неизвестная команда\n\n"
             "Доступные команды:\n"
-            "/admin add <user_id> - добавить админа\n"
+            "/admin add <user_id/@username> - добавить админа\n"
             "/admin del <user_id> - удалить админа\n"
             "/admin list - показать список"
         )
@@ -1896,7 +2282,7 @@ async def handle_blackjack_action(update: Update, context: ContextTypes.DEFAULT_
         # Игрок останавливается, ход дилера
         player_score = calculate_blackjack_score(game['player_hand'])
 
-        # Дилер берет карты до 17
+        # Дилер береты карты до 17
         while calculate_blackjack_score(game['dealer_hand']) < 17:
             card = game['deck'].pop()
             game['dealer_hand'].append(card)
@@ -2004,7 +2390,7 @@ async def handle_battleship_move(update: Update, context: ContextTypes.DEFAULT_T
 
     game = battleship_games[user_id]
     data_parts = query.data.split('_')
-    row, col, action = int(data_parts[1]), int(data_parts[2]), data_parts[3]
+    row, col, action = int(data_parts[1]], int(data_parts[2]], data_parts[3]
 
     if action == 'place':
         # Размещение кораблей игрока
@@ -2121,7 +2507,7 @@ async def handle_pc_selection(update: Update, context: ContextTypes.DEFAULT_TYPE
     cursor.execute('SELECT is_available FROM pc_list WHERE id = ?', (pc_id,))
     result = cursor.fetchone()
     conn.close()
-    
+
     if not result or not result[0]:
         await query.answer("❌ Этот ПК уже занят. Выберите другой.", show_alert=True)
         return
@@ -2234,7 +2620,8 @@ def main():
             CallbackQueryHandler(request_broadcast_message, pattern='^create_broadcast$'),
             CallbackQueryHandler(request_rename_topics_count, pattern='^create_rename_topics$'),
             CallbackQueryHandler(button_handler, pattern='^confirm_rename_'),
-            CallbackQueryHandler(start_guess_number_game, pattern='^game_guess_number$')
+            CallbackQueryHandler(start_guess_number_game, pattern='^game_guess_number$'),
+            CallbackQueryHandler(request_break_name, pattern='^create_break$')
         ],
         states={
             WAITING_FOR_TOPIC_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_topic_with_name)],
@@ -2243,7 +2630,12 @@ def main():
             WAITING_FOR_RENAME_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, create_rename_topics)],
             WAITING_FOR_RENAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, rename_topic)],
             WAITING_FOR_PC_SELECTION: [CallbackQueryHandler(button_handler, pattern='^select_pc_')],
-            PLAYING_GUESS_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_guess_number)]
+            PLAYING_GUESS_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_guess_number)],
+            WAITING_FOR_BREAK_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_break_name)],
+            WAITING_FOR_BREAK_START_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_break_start_time)],
+            WAITING_FOR_BREAK_START_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_break_start_text)],
+            WAITING_FOR_BREAK_END_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_break_end_time)],
+            WAITING_FOR_BREAK_END_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_break_end_text)]
         },
         fallbacks=[]
     )
@@ -2273,6 +2665,11 @@ def main():
             task.cancel()
         for task in sos_update_tasks.values():
             task.cancel()
+        # Отменяем задачи перерывов
+        for break_tasks_list in break_tasks.values():
+            for task in break_tasks_list:
+                if not task.done():
+                    task.cancel()
         logging.info("Бот остановлен")
 
 if __name__ == '__main__':
