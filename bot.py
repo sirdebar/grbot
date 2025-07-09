@@ -11,7 +11,7 @@ from telegram.error import RetryAfter
 from dotenv import load_dotenv
 
 load_dotenv()
-TOKEN = os.getenv('TELEGRAM_TOKEN')
+TOKEN = '8124277583:AAFRyLjTpFbN8sTqY6gkGCB-QWitq4xyh58'
 ADMIN_ID = int(os.getenv('ADMIN_ID', '0'))
 GAMES_ENABLED = os.getenv('GAMES_ENABLED', 'true').lower() == 'true'
 
@@ -284,8 +284,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = query.message.chat_id
 
-    # Проверяем административные права для всех действий кроме confirm_rename
-    if not query.data.startswith('confirm_rename_'):
+    # Проверяем административные права для всех действий кроме confirm_rename и select_pc
+    if not query.data.startswith('confirm_rename_') and not query.data.startswith('select_pc_') and not query.data.startswith('occupied_pc_'):
         if not await is_admin(chat_id, user_id, context):
             await query.answer("❌ У вас нет прав администратора", show_alert=True)
             return
@@ -763,7 +763,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if (not update.message.from_user.is_bot and 
             update.message.reply_to_message):
             # Проверяем, является ли это ответом на сообщение с запросом имени
-            reply_text = update.message.reply_to_message.text```python
+            reply_text = update.message.reply_to_message.text
             if (update.message.reply_to_message.from_user.is_bot and
                 reply_text and "Введите имя ответом на сообщение" in reply_text):
                 is_reply_to_name_request = True
@@ -1277,6 +1277,14 @@ async def process_break_end_time(update: Update, context: ContextTypes.DEFAULT_T
 
         return WAITING_FOR_BREAK_END_TEXT
 
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Неверный формат времени. Используйте формат ЧЧ:ММ\n"
+            "Пример: 11:00\n"
+            "Введите время окончания перерыва:"
+        )
+        return WAITING_FOR_BREAK_END_TIME
+
 async def process_break_end_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработать текст окончания перерыва и создать перерыв"""
     global break_id_counter
@@ -1496,18 +1504,18 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             admin_text = "\n".join([f"• {admin_id}" for admin_id in sorted(admin_list)])
             await update.message.reply_text(
                 f"📋 Список дополнительных администраторов:\n{admin_text}\n\n"
-                f"Использование:\n"
-                f"/admin add <user_id/@username> - добавить админа\n"
-                f"/admin del <user_id> - удалить админа\n"
-                f"/admin list - показать список"
+                "Использование:\n"
+                "/admin add <user_id|@username> - добавить админа\n"
+                "/admin del <user_id> - удалить админа\n"
+                "/admin list - показать список"
             )
         else:
             await update.message.reply_text(
                 "📋 Список дополнительных администраторов пуст\n\n"
-                f"Использование:\n"
-                f"/admin add <user_id/@username> - добавить админа\n"
-                f"/admin del <user_id> - удалить админа\n"
-                f"/admin list - показать список"
+                "Использование:\n"
+                "/admin add <user_id|@username> - добавить админа\n"
+                "/admin del <user_id> - удалить админа\n"
+                "/admin list - показать список"
             )
         return
 
@@ -1522,41 +1530,67 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "add":
         if len(context.args) < 2:
-            await update.message.reply_text("❌ Укажите user_id: /admin add <user_id>")
-            return        try:
-            new_admin_id = int(context.args[1])
-            if new_admin_id == ADMIN_ID:
-                await update.message.reply_text("❌ Вы уже являетесь главным администратором")
-                return
+            await update.message.reply_text("❌ Укажите user_id или @username: /admin add <user_id>")
+            return
 
-            if new_admin_id in admin_list:
-                await update.message.reply_text("❌ Этот пользователь уже является администратором")
-                return
+        user_input = context.args[1]
+        new_admin_id = None
 
-            admin_list.add(new_admin_id)
-            await update.message.reply_text(f"✅ Пользователь {new_admin_id} добавлен в администраторы")
-
-        except ValueError:
-            # Попытка добавить по username
-            username = context.args[1]
+        # Проверяем, если это тег пользователя (@username)
+        if user_input.startswith('@'):
+            username = user_input[1:]  # Убираем @
             try:
-                # Получаем информацию о пользователе по username (работает только если пользователь есть в чате)
-                chat_member = await context.bot.get_chat_member(chat_id=update.effective_chat.id, user_id=username)
-                new_admin_id = chat_member.user.id
-
-                if new_admin_id == ADMIN_ID:
-                    await update.message.reply_text("❌ Вы уже являетесь главным администратором")
+                # Пытаемся найти пользователя по username в текущем чате
+                chat_id = update.effective_chat.id
+                
+                # Получаем администраторов чата
+                chat_admins = await context.bot.get_chat_administrators(chat_id)
+                for admin in chat_admins:
+                    if admin.user.username and admin.user.username.lower() == username.lower():
+                        new_admin_id = admin.user.id
+                        break
+                
+                # Если не нашли среди админов, пробуем среди участников
+                if not new_admin_id:
+                    try:
+                        chat_member = await context.bot.get_chat_member(chat_id, f"@{username}")
+                        if chat_member and chat_member.user:
+                            new_admin_id = chat_member.user.id
+                    except Exception:
+                        pass
+                
+                if not new_admin_id:
+                    await update.message.reply_text(f"❌ Пользователь @{username} не найден в этом чате")
                     return
-
-                if new_admin_id in admin_list:
-                    await update.message.reply_text("❌ Этот пользователь уже является администратором")
-                    return
-
-                admin_list.add(new_admin_id)
-                await update.message.reply_text(f"✅ Пользователь {username} (ID: {new_admin_id}) добавлен в администраторы")
-
+                    
             except Exception as e:
-                await update.message.reply_text("❌ Неверный формат user_id или username")
+                await update.message.reply_text(f"❌ Ошибка при поиске пользователя @{username}: {str(e)}")
+                return
+        else:
+            # Это ID пользователя
+            try:
+                new_admin_id = int(user_input)
+            except ValueError:
+                await update.message.reply_text("❌ Неверный формат. Используйте user_id или @username")
+                return
+
+        if new_admin_id == ADMIN_ID:
+            await update.message.reply_text("❌ Вы уже являетесь главным администратором")
+            return
+
+        if new_admin_id in admin_list:
+            await update.message.reply_text("❌ Этот пользователь уже является администратором")
+            return
+
+        admin_list.add(new_admin_id)
+        
+        # Получаем информацию о пользователе для подтверждения
+        try:
+            user_info = await context.bot.get_chat_member(update.effective_chat.id, new_admin_id)
+            user_display = f"@{user_info.user.username}" if user_info.user.username else f"ID:{new_admin_id}"
+            await update.message.reply_text(f"✅ Пользователь {user_display} добавлен в администраторы")
+        except Exception:
+            await update.message.reply_text(f"✅ Пользователь с ID {new_admin_id} добавлен в администраторы")
 
     elif action == "del":
         if len(context.args) < 2:
@@ -1583,7 +1617,7 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ Неизвестная команда\n\n"
             "Доступные команды:\n"
-            "/admin add <user_id/@username> - добавить админа\n"
+            "/admin add <user_id|@username> - добавить админа\n"
             "/admin del <user_id> - удалить админа\n"
             "/admin list - показать список"
         )
@@ -2282,7 +2316,7 @@ async def handle_blackjack_action(update: Update, context: ContextTypes.DEFAULT_
         # Игрок останавливается, ход дилера
         player_score = calculate_blackjack_score(game['player_hand'])
 
-        # Дилер береты карты до 17
+        # Дилер берет карты до 17
         while calculate_blackjack_score(game['dealer_hand']) < 17:
             card = game['deck'].pop()
             game['dealer_hand'].append(card)
@@ -2390,7 +2424,7 @@ async def handle_battleship_move(update: Update, context: ContextTypes.DEFAULT_T
 
     game = battleship_games[user_id]
     data_parts = query.data.split('_')
-    row, col, action = int(data_parts[1]], int(data_parts[2]], data_parts[3]
+    row, col, action = int(data_parts[1]), int(data_parts[2]), data_parts[3]
 
     if action == 'place':
         # Размещение кораблей игрока
