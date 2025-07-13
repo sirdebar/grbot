@@ -28,6 +28,10 @@ WAITING_FOR_BREAK_START_TIME = 8
 WAITING_FOR_BREAK_START_TEXT = 9
 WAITING_FOR_BREAK_END_TIME = 10
 WAITING_FOR_BREAK_END_TEXT = 11
+WAITING_FOR_COMPLAINT_TARGET = 12
+WAITING_FOR_COMPLAINT_REASON = 13
+WAITING_FOR_SUPPORT_MESSAGE = 14
+WAITING_FOR_ADMIN_RESPONSE = 15
 
 # Global variables
 topics_dict = {}
@@ -45,6 +49,9 @@ breaks_dict = {}
 break_id_counter = 1
 break_tasks = {}
 pc_mode_enabled = True
+pending_complaints = {}
+support_tickets = {}
+ticket_id_counter = 1
 
 # Timezone
 KYIV_TZ = pytz.timezone('Europe/Kiev')

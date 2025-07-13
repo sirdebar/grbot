@@ -16,7 +16,7 @@ from config import (
     ADMIN_ID, topics_dict, workers_dict, rename_topics_dict, sos_words,
     active_topics, active_topics_info, sos_activation_times, sos_removal_tasks,
     sos_update_tasks, restricted_topics, admin_list, breaks_dict, break_id_counter,
-    break_tasks, pc_mode_enabled, KYIV_TZ
+    break_tasks, pc_mode_enabled, pending_complaints, support_tickets, ticket_id_counter, KYIV_TZ
 )
 from utils import (
     check_forum_support, is_admin, clear_rename_context, create_active_topics_thread,
@@ -38,6 +38,10 @@ class TopicStates(StatesGroup):
     waiting_for_break_start_text = State()
     waiting_for_break_end_time = State()
     waiting_for_break_end_text = State()
+    waiting_for_complaint_target = State()
+    waiting_for_complaint_reason = State()
+    waiting_for_support_message = State()
+    waiting_for_admin_response = State()
 
 @router.message(Command("start"))
 async def start_command(message: Message, state: FSMContext):
@@ -82,15 +86,37 @@ async def start_command(message: Message, state: FSMContext):
         reply_markup=reply_markup
     )
 
+@router.message(Command("menu"))
+async def menu_command(message: Message, state: FSMContext):
+    await state.clear()
+    
+    keyboard = [
+        [InlineKeyboardButton(text="📢 Пожаловаться", callback_data='complaint')],
+        [InlineKeyboardButton(text="🛠 Тех.поддержка", callback_data='support')],
+        [InlineKeyboardButton(text="🌐 Сайт", callback_data='website')]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+    
+    await message.answer(
+        "📋 Меню:",
+        reply_markup=reply_markup
+    )
+
 @router.callback_query(F.data.in_(['list_topics', 'create_topic', 'delete_topic', 'delete_all_topics', 
                                    'create_broadcast', 'create_rename_topics', 'break_menu', 'create_break',
-                                   'list_breaks', 'back_to_start']))
+                                   'list_breaks', 'back_to_start', 'complaint', 'support', 'website',
+                                   'complaint_yes', 'complaint_no']) | F.data.startswith('user_reply_ticket_'))
 async def button_handler(callback: CallbackQuery, state: FSMContext):
     user_id = callback.from_user.id
     chat_id = callback.message.chat.id
 
-    # Проверяем административные права для всех действий кроме confirm_rename и select_pc
-    if not callback.data.startswith('confirm_rename_') and not callback.data.startswith('select_pc_') and not callback.data.startswith('occupied_pc_'):
+    # Проверяем административные права только для админских действий
+    admin_only_actions = ['list_topics', 'create_topic', 'delete_topic', 'delete_all_topics', 
+                         'create_broadcast', 'create_rename_topics', 'break_menu', 'create_break',
+                         'list_breaks', 'back_to_start']
+    
+    if callback.data in admin_only_actions:
         if not await is_admin(chat_id, user_id, callback.bot):
             await callback.answer("❌ У вас нет прав администратора", show_alert=True)
             return
@@ -117,6 +143,18 @@ async def button_handler(callback: CallbackQuery, state: FSMContext):
         await list_breaks(callback)
     elif callback.data == 'back_to_start':
         await start_menu_after_back(callback)
+    elif callback.data == 'complaint':
+        await start_complaint(callback, state)
+    elif callback.data == 'support':
+        await start_support(callback, state)
+    elif callback.data == 'website':
+        await show_website(callback)
+    elif callback.data == 'complaint_yes':
+        await confirm_complaint(callback, state)
+    elif callback.data == 'complaint_no':
+        await cancel_complaint(callback, state)
+    elif callback.data.startswith('user_reply_ticket_'):
+        await user_reply_to_ticket(callback, state)
 
 @router.callback_query(F.data.startswith('delete_break_'))
 async def delete_break_callback(callback: CallbackQuery):
@@ -153,7 +191,7 @@ async def handle_rename_confirmation(callback: CallbackQuery, state: FSMContext)
         "> ⛔️ Без этого тема останется в статусе «Без названия» и будет неактивной.",
         parse_mode='Markdown'
     )
-    
+
     await state.update_data(request_name_message_id=message.message_id)
 
     # Отправляем дополнительное сообщение в тему
@@ -556,7 +594,7 @@ async def request_rename_topics_count(callback: CallbackQuery, state: FSMContext
 @router.message(TopicStates.waiting_for_rename_count)
 async def create_rename_topics(message: Message, state: FSMContext):
     global break_id_counter
-    
+
     try:
         count = int(message.text)
         if count <= 0:
@@ -690,7 +728,7 @@ async def rename_topic(message: Message, state: FSMContext):
             try:
                 confirmation_message_id = data.get('confirmation_message_id')
                 request_name_message_id = data.get('request_name_message_id')
-                
+
                 if confirmation_message_id:
                     await message.bot.delete_message(
                         chat_id=chat_id,
@@ -794,7 +832,7 @@ async def rename_topic(message: Message, state: FSMContext):
     try:
         confirmation_message_id = data.get('confirmation_message_id')
         request_name_message_id = data.get('request_name_message_id')
-        
+
         if confirmation_message_id:
             await message.bot.delete_message(
                 chat_id=topic_data['chat_id'],
@@ -939,7 +977,7 @@ async def process_break_end_time(message: Message, state: FSMContext):
     try:
         # Проверяем формат времени
         end_time_obj = datetime.strptime(time_text, "%H:%M").time()
-        
+
         data = await state.get_data()
         start_time_obj = datetime.strptime(data['break_data']['start_time'], "%H:%M").time()
 
@@ -1541,6 +1579,356 @@ async def admin_command(message: Message):
             "/admin del <user_id> - удалить админа\n"
             "/admin list - показать список"
         )
+
+# Menu functions
+async def start_complaint(callback: CallbackQuery, state: FSMContext):
+    """Начать процесс подачи жалобы"""
+    await callback.message.edit_text(
+        "📢 Подача жалобы\n\n"
+        "Введите никнейм пользователя, на которого хотите пожаловаться:"
+    )
+    await state.set_state(TopicStates.waiting_for_complaint_target)
+
+@router.message(TopicStates.waiting_for_complaint_target)
+async def process_complaint_target(message: Message, state: FSMContext):
+    """Обработать цель жалобы"""
+    target_username = message.text.strip()
+    user_username = message.from_user.username or f"ID:{message.from_user.id}"
+    
+    # Сохраняем данные жалобы
+    complaint_data = {
+        'from_user': user_username,
+        'from_user_id': message.from_user.id,
+        'target': target_username,
+        'chat_id': message.chat.id
+    }
+    
+    await state.update_data(complaint_data=complaint_data)
+    
+    # Показываем подтверждение
+    keyboard = [
+        [InlineKeyboardButton(text="✅ Да", callback_data='complaint_yes')],
+        [InlineKeyboardButton(text="❌ Нет, я ошибся", callback_data='complaint_no')]
+    ]
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+    
+    await message.answer(
+        f"Вы (@{user_username}) хотите подать жалобу на {target_username}?",
+        reply_markup=reply_markup
+    )
+
+async def confirm_complaint(callback: CallbackQuery, state: FSMContext):
+    """Подтвердить жалобу"""
+    await callback.message.edit_text(
+        "📝 Опишите причину жалобы:"
+    )
+    await state.set_state(TopicStates.waiting_for_complaint_reason)
+
+async def cancel_complaint(callback: CallbackQuery, state: FSMContext):
+    """Отменить жалобу"""
+    await callback.message.edit_text("❌ Жалоба отменена.")
+    await state.clear()
+
+@router.message(TopicStates.waiting_for_complaint_reason)
+async def process_complaint_reason(message: Message, state: FSMContext):
+    """Обработать причину жалобы"""
+    reason = message.text.strip()
+    data = await state.get_data()
+    complaint_data = data.get('complaint_data')
+    
+    if not complaint_data:
+        await message.answer("❌ Ошибка: данные жалобы не найдены")
+        await state.clear()
+        return
+    
+    # Отправляем благодарность пользователю
+    await message.answer(
+        "✅ Благодарим за содействие! 🙏\n"
+        "Администратор получит ваше обращение и рассмотрит его. 👨‍💼"
+    )
+    
+    # Отправляем жалобу администратору
+    admin_message = (
+        "🚨 Новая жалоба!\n\n"
+        f"👤 От: @{complaint_data['from_user']}\n"
+        f"🎯 На: {complaint_data['target']}\n"
+        f"📝 Причина: {reason}\n\n"
+        f"💬 Чат: {complaint_data['chat_id']}"
+    )
+    
+    # Отправляем главному админу
+    if ADMIN_ID != 0:
+        try:
+            await message.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=admin_message
+            )
+        except Exception as e:
+            logging.error(f"Не удалось отправить жалобу админу: {str(e)}")
+    
+    # Отправляем всем дополнительным админам
+    for admin_id in admin_list:
+        try:
+            await message.bot.send_message(
+                chat_id=admin_id,
+                text=admin_message
+            )
+        except Exception as e:
+            logging.error(f"Не удалось отправить жалобу админу {admin_id}: {str(e)}")
+    
+    await state.clear()
+
+async def start_support(callback: CallbackQuery, state: FSMContext):
+    """Начать процесс технической поддержки"""
+    await callback.message.edit_text(
+        "🛠 Техническая поддержка\n\n"
+        "Опишите вашу проблему или вопрос:"
+    )
+    await state.set_state(TopicStates.waiting_for_support_message)
+
+@router.message(TopicStates.waiting_for_support_message)
+async def process_support_message(message: Message, state: FSMContext):
+    """Обработать сообщение в поддержку"""
+    global ticket_id_counter
+    
+    data = await state.get_data()
+    user_replying_ticket_id = data.get('user_replying_ticket_id')
+    
+    support_message = message.text.strip()
+    user_username = message.from_user.username or f"ID:{message.from_user.id}"
+    
+    if user_replying_ticket_id:
+        # Это ответ пользователя на существующий тикет
+        if user_replying_ticket_id not in support_tickets:
+            await message.answer("❌ Ошибка: тикет не найден")
+            await state.clear()
+            return
+        
+        ticket = support_tickets[user_replying_ticket_id]
+        if ticket['status'] == 'closed':
+            await message.answer("❌ Тикет уже закрыт")
+            await state.clear()
+            return
+        
+        # Отправляем подтверждение пользователю
+        await message.answer(
+            f"✅ Ваш ответ на тикет #{user_replying_ticket_id} отправлен!"
+        )
+        
+        # Создаем кнопки для админа
+        keyboard = [
+            [InlineKeyboardButton(text="💬 Ответить", callback_data=f'respond_ticket_{user_replying_ticket_id}')],
+            [InlineKeyboardButton(text="❌ Закрыть тикет", callback_data=f'close_ticket_{user_replying_ticket_id}')]
+        ]
+        reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+        
+        # Отправляем ответ пользователя администратору
+        admin_message = (
+            f"💬 Ответ пользователя на тикет #{user_replying_ticket_id}\n\n"
+            f"👤 От: @{user_username}\n"
+            f"📝 Сообщение: {support_message}\n"
+            f"💬 Чат: {message.chat.id}\n\n"
+            f"📋 Исходный вопрос: {ticket['message']}"
+        )
+        
+        # Отправляем главному админу
+        if ADMIN_ID != 0:
+            try:
+                await message.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=admin_message,
+                    reply_markup=reply_markup
+                )
+            except Exception as e:
+                logging.error(f"Не удалось отправить ответ пользователя админу: {str(e)}")
+        
+        # Отправляем всем дополнительным админам
+        for admin_id in admin_list:
+            try:
+                await message.bot.send_message(
+                    chat_id=admin_id,
+                    text=admin_message,
+                    reply_markup=reply_markup
+                )
+            except Exception as e:
+                logging.error(f"Не удалось отправить ответ пользователя админу {admin_id}: {str(e)}")
+    
+    else:
+        # Это новый тикет
+        ticket_id = ticket_id_counter
+        ticket_id_counter += 1
+        
+        support_tickets[ticket_id] = {
+            'user_id': message.from_user.id,
+            'username': user_username,
+            'message': support_message,
+            'chat_id': message.chat.id,
+            'status': 'open'
+        }
+        
+        # Отправляем подтверждение пользователю
+        await message.answer(
+            f"🎫 Ваш тикет #{ticket_id} создан!\n"
+            "📧 Мы получили ваше обращение и скоро ответим. ⏰"
+        )
+        
+        # Создаем кнопки для админа
+        keyboard = [
+            [InlineKeyboardButton(text="💬 Ответить", callback_data=f'respond_ticket_{ticket_id}')],
+            [InlineKeyboardButton(text="❌ Закрыть тикет", callback_data=f'close_ticket_{ticket_id}')]
+        ]
+        reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+        
+        # Отправляем тикет администратору
+        admin_message = (
+            f"🎫 Новый тикет #{ticket_id}\n\n"
+            f"👤 От: @{user_username}\n"
+            f"📝 Сообщение: {support_message}\n"
+            f"💬 Чат: {message.chat.id}"
+        )
+        
+        # Отправляем главному админу
+        if ADMIN_ID != 0:
+            try:
+                await message.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=admin_message,
+                    reply_markup=reply_markup
+                )
+            except Exception as e:
+                logging.error(f"Не удалось отправить тикет админу: {str(e)}")
+        
+        # Отправляем всем дополнительным админам
+        for admin_id in admin_list:
+            try:
+                await message.bot.send_message(
+                    chat_id=admin_id,
+                    text=admin_message,
+                    reply_markup=reply_markup
+                )
+            except Exception as e:
+                logging.error(f"Не удалось отправить тикет админу {admin_id}: {str(e)}")
+    
+    await state.clear()
+
+async def show_website(callback: CallbackQuery):
+    """Показать информацию о сайте"""
+    await callback.answer("🚧 Сайт в разработке", show_alert=True)
+
+# Support ticket handlers
+@router.callback_query(F.data.startswith('respond_ticket_'))
+async def respond_to_ticket(callback: CallbackQuery, state: FSMContext):
+    """Ответить на тикет"""
+    ticket_id = int(callback.data.split('_')[2])
+    
+    if ticket_id not in support_tickets:
+        await callback.answer("❌ Тикет не найден", show_alert=True)
+        return
+    
+    ticket = support_tickets[ticket_id]
+    if ticket['status'] == 'closed':
+        await callback.answer("❌ Тикет уже закрыт", show_alert=True)
+        return
+    
+    await state.update_data(responding_ticket_id=ticket_id)
+    await callback.message.answer(
+        f"💬 Ответ на тикет #{ticket_id}\n"
+        f"Пользователь: @{ticket['username']}\n"
+        f"Вопрос: {ticket['message']}\n\n"
+        "Введите ваш ответ:"
+    )
+    await state.set_state(TopicStates.waiting_for_admin_response)
+
+@router.message(TopicStates.waiting_for_admin_response)
+async def process_admin_response(message: Message, state: FSMContext):
+    """Обработать ответ администратора"""
+    data = await state.get_data()
+    ticket_id = data.get('responding_ticket_id')
+    
+    if not ticket_id or ticket_id not in support_tickets:
+        await message.answer("❌ Ошибка: тикет не найден")
+        await state.clear()
+        return
+    
+    ticket = support_tickets[ticket_id]
+    admin_response = message.text.strip()
+    
+    # Создаем кнопку для продолжения разговора
+    keyboard = [
+        [InlineKeyboardButton(text="💬 Ответить", callback_data=f'user_reply_ticket_{ticket_id}')]
+    ]
+    reply_markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+    
+    # Отправляем ответ пользователю
+    try:
+        await message.bot.send_message(
+            chat_id=ticket['user_id'],
+            text=f"📧 Ответ администратора по тикету #{ticket_id}:\n\n{admin_response}",
+            reply_markup=reply_markup
+        )
+        
+        await message.answer(f"✅ Ответ отправлен пользователю @{ticket['username']}")
+        
+    except Exception as e:
+        await message.answer(f"❌ Не удалось отправить ответ: {str(e)}")
+        logging.error(f"Ошибка при отправке ответа на тикет: {str(e)}")
+    
+    await state.clear()
+
+@router.callback_query(F.data.startswith('user_reply_ticket_'))
+async def user_reply_to_ticket(callback: CallbackQuery, state: FSMContext):
+    """Пользователь отвечает на тикет"""
+    ticket_id = int(callback.data.split('_')[3])
+    
+    if ticket_id not in support_tickets:
+        await callback.answer("❌ Тикет не найден", show_alert=True)
+        return
+    
+    ticket = support_tickets[ticket_id]
+    if ticket['status'] == 'closed':
+        await callback.answer("❌ Тикет уже закрыт", show_alert=True)
+        return
+    
+    # Проверяем, что отвечает тот же пользователь, который создал тикет
+    if callback.from_user.id != ticket['user_id']:
+        await callback.answer("❌ Вы можете отвечать только на свои тикеты", show_alert=True)
+        return
+    
+    await state.update_data(user_replying_ticket_id=ticket_id)
+    await callback.message.answer(
+        f"💬 Ваш ответ на тикет #{ticket_id}:\n"
+        "Введите ваше сообщение:"
+    )
+    await state.set_state(TopicStates.waiting_for_support_message)
+
+@router.callback_query(F.data.startswith('close_ticket_'))
+async def close_ticket(callback: CallbackQuery):
+    """Закрыть тикет"""
+    ticket_id = int(callback.data.split('_')[2])
+    
+    if ticket_id not in support_tickets:
+        await callback.answer("❌ Тикет не найден", show_alert=True)
+        return
+    
+    ticket = support_tickets[ticket_id]
+    ticket['status'] = 'closed'
+    
+    # Уведомляем пользователя о закрытии тикета
+    try:
+        await callback.bot.send_message(
+            chat_id=ticket['user_id'],
+            text=f"🔒 Ваш тикет #{ticket_id} был закрыт администратором."
+        )
+    except Exception as e:
+        logging.error(f"Не удалось уведомить пользователя о закрытии тикета: {str(e)}")
+    
+    await callback.message.edit_text(
+        f"🔒 Тикет #{ticket_id} закрыт\n\n"
+        f"Пользователь: @{ticket['username']}\n"
+        f"Вопрос: {ticket['message']}"
+    )
+    
+    await callback.answer("✅ Тикет закрыт")
 
 # Message handler for general messages
 @router.message()

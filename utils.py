@@ -311,7 +311,7 @@ async def send_break_notification_to_all_topics(message_text: str, bot: Bot):
 async def schedule_break_tasks(break_id: int, break_data: dict, bot: Bot):
     """Планировать задачи для перерыва"""
     from config import break_tasks
-    
+
     if break_id not in break_tasks:
         break_tasks[break_id] = []
 
